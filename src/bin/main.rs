@@ -19,8 +19,8 @@ use defmt::info;
 
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Flex, Level, Output, OutputConfig};
-use esp_hal::main;
 use esp_hal::time::{Duration, Instant};
+use esp_hal::{init, main};
 use esp_println as _;
 
 struct S3interface<'a> {
@@ -33,6 +33,8 @@ struct S3interface<'a> {
     time_setup_hold: u32,
     time_clk_low: u32,
     time_clk_high: u32,
+    time_dummy_low: u32,
+    time_dummy_high: u32,
     delay: Delay,
 }
 
@@ -47,6 +49,8 @@ impl<'a> S3interface<'a> {
             time_setup_hold: 100,
             time_clk_low: 100,
             time_clk_high: 100,
+            time_dummy_low: 20,
+            time_dummy_high: 20,
             delay: Delay::new(),
         }
     }
@@ -62,30 +66,34 @@ impl<'a> S3interface<'a> {
     }
 
     /// 프로그래밍 모드 시작 함수
-    pub fn enterProgramMode(&mut self) {
+    pub fn enter_program_mode(&mut self) {
         self.reset.set_low();
+        self.delay.delay_micros(self.time_setup_start);
         self.vpp.set_high();
+        self.delay.delay_micros(self.time_setup_hold);
     }
 
-    pub fn dummyClk(&mut self) {
+    pub fn dummy_clock(&mut self) {
         self.sdat.set_input_enable(false);
         self.sdat.set_output_enable(true);
-
-        self.delay.delay_micros(self.time_clk_low);
+        self.sclk.set_low();
+        self.delay.delay_micros(1); // 핀 상태 안정화
         self.sdat.set_high();
+        self.sclk.set_low();
+        self.delay.delay_micros(self.time_clk_low);
+
         self.sclk.set_high();
         self.delay.delay_micros(self.time_clk_high);
-        self.sclk.set_low();
-        self.sdat.set_low();
-
-        self.sdat.set_input_enable(true);
-        self.sdat.set_output_enable(false);
     }
 
-    pub fn read(&mut self, addr: u16, len: usize) -> [u8; 128] {
+    pub fn read(&mut self, addr: u16, len: usize) -> [u8; 1024] {
         let byte1: u8 = 0x61u8;
+        self.send_byte(byte1);
+        self.send_byte((addr >> 8) as u8);
+        self.send_byte(addr as u8);
+        /*
         for i in (0..=7).rev() {
-            //info!("i : {}", i);
+            self.sclk.set_low();
             if ((0x01 << i) & byte1) != 0 {
                 self.sdat.set_high();
             } else {
@@ -95,11 +103,55 @@ impl<'a> S3interface<'a> {
             self.delay.delay_micros(self.time_clk_low);
             self.sclk.set_high();
             self.delay.delay_micros(self.time_clk_high);
+        }*/
+        //self.dummy_clock();
+        /*for i in (0..=15).rev() {
             self.sclk.set_low();
-        }
-        self.dummyClk();
-        for i in (0..=15).rev() {
             if ((0x01u16 << i) & addr) != 0 {
+                self.sdat.set_high();
+            } else {
+                self.sdat.set_low();
+            }
+
+            self.delay.delay_micros(self.time_dummy_low);
+            self.sclk.set_high();
+            self.delay.delay_micros(self.time_dummy_high);
+            if i == 8 || i == 0 {
+                self.dummy_clock();
+            }
+        }*/
+
+        let mut mem: [u8; 1024] = [0; 1024];
+        for i in 0..len {
+            mem[i] = self.read_byte();
+            //info!("{}", mem[i]);
+        }
+        mem
+    }
+    pub fn read_byte(&mut self) -> u8 {
+        self.sdat.set_input_enable(true);
+        self.sdat.set_output_enable(false);
+        let mut readed: u8 = 0u8;
+        for i in (0..=7).rev() {
+            self.sclk.set_low();
+            self.delay.delay_micros(self.time_clk_low);
+            self.sclk.set_high();
+            self.delay.delay_micros(self.time_clk_high / 2);
+            if self.sdat.is_high() {
+                //info!("test");
+                readed = readed | (0x01 << i);
+            }
+            self.delay.delay_micros(self.time_clk_high / 2);
+        }
+        self.dummy_clock();
+        readed
+    }
+    pub fn send_byte(&mut self, byte: u8) {
+        self.sdat.set_input_enable(false);
+        self.sdat.set_output_enable(true);
+        for i in (0..=7).rev() {
+            self.sclk.set_low();
+            if ((0x01 << i) & byte) != 0 {
                 self.sdat.set_high();
             } else {
                 self.sdat.set_low();
@@ -108,43 +160,50 @@ impl<'a> S3interface<'a> {
             self.delay.delay_micros(self.time_clk_low);
             self.sclk.set_high();
             self.delay.delay_micros(self.time_clk_high);
-            self.sclk.set_low();
-            if i == 8 || i == 0 {
-                self.dummyClk();
-            }
         }
+        self.dummy_clock();
+    }
 
-        let mut mem: [u8; 128] = [0; 128];
-        for i in 0..len {
-            mem[i] = self.readbyte();
-        }
-        mem
+    pub fn write(&mut self, addr: u16, byte: u8) {
+        self.start_condition();
+        self.send_byte(0x00);
+        self.send_byte((addr >> 8) as u8);
+        self.send_byte(addr as u8);
+        self.send_byte(byte);
+        self.send_byte(0xFF);
+        self.stop_condition();
     }
-    pub fn readbyte(&mut self) -> u8 {
-        let mut readed: u8 = 0u8;
-        for i in (0..=7).rev() {
-            self.delay.delay_micros(self.time_clk_low);
-            self.sclk.set_high();
-            self.delay.delay_micros(self.time_clk_high / 2);
-            if self.sdat.is_high() {
-                readed = readed | (0x01 << i);
-            }
-            self.delay.delay_micros(self.time_clk_high / 2);
-            self.sclk.set_low();
-        }
-        readed
+    pub fn erase(&mut self) {
+        self.start_condition();
+        self.send_byte(0xE0);
+        self.send_byte(0x55);
+        self.send_byte(0x15);
+        self.send_byte(0xAA);
+        self.send_byte(0xFF);
+        self.stop_condition();
+        self.delay.delay_millis(2000);
     }
-    pub fn startCondition(&mut self) {
+    pub fn start_condition(&mut self) {
         self.sdat.set_input_enable(false);
         self.sdat.set_output_enable(true);
+        self.sdat.set_low();
+        self.sclk.set_low();
+        self.delay.delay_millis(1);
+
         self.sclk.set_high();
         self.delay.delay_nanos(self.time_setup_start);
         self.sdat.set_high();
         self.delay.delay_nanos(self.time_setup_hold);
     }
-    pub fn stopCondition(&mut self) {
+    pub fn stop_condition(&mut self) {
         self.sdat.set_input_enable(false);
-        self.sdat.set_output_enable(true);
+        self.sdat.set_output_enable(true); // 마스터가 SDAT 제어권 확보
+        self.sdat.set_high(); // SDAT를 High로 설정
+        self.delay.delay_micros(1); // 안정화 대기
+        self.sclk.set_high(); // SCLK를 High(VDD)로 유지
+        self.delay.delay_micros(1); // thp 지연 (최소 1us) [7, 8]
+        self.sdat.set_low(); // 하강 에지 발생 (Stop Condition) [1, 2]
+        self.delay.delay_micros(1); // 종료 후 대기
     }
 }
 
@@ -192,105 +251,36 @@ fn main() -> ! {
     let mut readed: u8;
     let mut mem: [u8; 128] = [0; 128];
     info!("Hello");
-    info!("READ {} to {}", addr, addr + 127);
-    reset.set_high();
-    vpp.set_low();
 
-    info!("start pattern");
-    reset.set_low();
-    delay.delay_nanos(100);
-    vpp.set_high();
-    loop {
-        sclk.set_high();
-        delay.delay_nanos(time_setup_start);
-        sdat.set_high();
-        delay.delay_nanos(time_setup_hold);
-        // now start pattern
-        sclk.set_low();
+    let len = 128;
 
-        sdat.set_low();
-        sdat.set_input_enable(false);
-        sdat.set_output_enable(true);
-
-        for i in (0..=7).rev() {
-            //info!("i : {}", i);
-            if ((0x01 << i) & byte1) != 0 {
-                sdat.set_high();
-            } else {
-                sdat.set_low();
-            }
-
-            delay.delay_micros(time_clk_low);
-            sclk.set_high();
-            delay.delay_micros(time_clk_high);
-            sclk.set_low();
-        }
-        for i in (0..=15).rev() {
-            if ((0x01u16 << i) & addr) != 0 {
-                sdat.set_high();
-            } else {
-                sdat.set_low();
-            }
-
-            delay.delay_micros(time_clk_low);
-            sclk.set_high();
-            delay.delay_micros(time_clk_high);
-            sclk.set_low();
-        }
-        // dummy clock for read
-        //
-        //
-        //
-        //let mut cnt = 0;
-
-        for j in 0..=127usize {
-            sdat.set_input_enable(false);
-            sdat.set_output_enable(true);
-
-            delay.delay_micros(time_clk_low);
-            sdat.set_high();
-            sclk.set_high();
-            delay.delay_micros(time_clk_high);
-            sclk.set_low();
-            sdat.set_low();
-            delay.delay_micros(time_clk_low);
-
-            sdat.set_input_enable(true);
-            sdat.set_output_enable(false);
-
-            readed = 0u8;
-
-            for i in (0..=7).rev() {
-                delay.delay_micros(time_clk_low);
-                sclk.set_high();
-                delay.delay_micros(time_clk_high / 2);
-                if sdat.is_high() {
-                    readed = readed | (0x01 << i);
-                }
-                delay.delay_micros(time_clk_high / 2);
-                sclk.set_low();
-            }
-            //info!("{}", readed);
-            mem[j] = readed;
-            delay.delay_micros(40);
-            //info!("0x{} + {} result {}", addr, j, readed);
-        }
-
-        for j in 0..=127usize {
-            info!("{}", mem[j]);
-        }
-        info!("Done");
-        loop {
-            let delay_start = Instant::now();
-            while delay_start.elapsed() < Duration::from_millis(500) {}
-            break;
-        }
-        break;
-    }
     let mut s3 = S3interface::new(reset, vpp, sclk, sdat);
     s3.init();
-    s3.enterProgramMode();
-    loop {}
+    s3.enter_program_mode();
+
+    //    s3.erase();
+    s3.init();
+    s3.enter_program_mode();
+
+    for addr in 0..100 {
+        s3.init();
+        s3.enter_program_mode();
+        s3.write(addr, 0xaa);
+    }
+    for addr in 0..1 {
+        s3.init();
+        s3.enter_program_mode();
+        s3.start_condition();
+        let mem = s3.read(addr, len);
+        info!("{}", mem[0..128]);
+        s3.stop_condition();
+    }
+
+    s3.init();
+    s3.enter_program_mode();
+    loop {
+        delay.delay_millis(100);
+    }
 
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.1.0/examples
 }
