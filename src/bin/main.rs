@@ -11,6 +11,8 @@
 fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
+use core::fmt::Write;
+
 //use core::fmt::DebugList;
 //use embedded_hal::delay::DelayNs;
 use esp_hal::delay::Delay;
@@ -19,8 +21,8 @@ use defmt::info;
 
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Flex, Level, Output, OutputConfig};
-use esp_hal::time::{Duration, Instant};
-use esp_hal::{init, main};
+use esp_hal::usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx, UsbSerialJtagTx};
+use esp_hal::{main, usb_serial_jtag};
 use esp_println as _;
 
 struct S3interface<'a> {
@@ -49,8 +51,8 @@ impl<'a> S3interface<'a> {
             time_setup_hold: 100,
             time_clk_low: 100,
             time_clk_high: 100,
-            time_dummy_low: 20,
-            time_dummy_high: 20,
+            time_dummy_low: 100,
+            time_dummy_high: 100,
             delay: Delay::new(),
         }
     }
@@ -80,10 +82,10 @@ impl<'a> S3interface<'a> {
         self.delay.delay_micros(1); // 핀 상태 안정화
         self.sdat.set_high();
         self.sclk.set_low();
-        self.delay.delay_micros(self.time_clk_low);
+        self.delay.delay_micros(self.time_dummy_low);
 
         self.sclk.set_high();
-        self.delay.delay_micros(self.time_clk_high);
+        self.delay.delay_micros(self.time_dummy_high);
     }
 
     pub fn read(&mut self, addr: u16, len: usize) -> [u8; 1024] {
@@ -219,18 +221,18 @@ esp_bootloader_esp_idf::esp_app_desc!();
 fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let _peripherals = esp_hal::init(config);
-    let mut reset = Output::new(
+    let reset = Output::new(
         _peripherals.GPIO4,
         Level::High,
         OutputConfig::default().with_drive_mode(esp_hal::gpio::DriveMode::PushPull),
     );
 
-    let mut vpp = Output::new(
+    let vpp = Output::new(
         _peripherals.GPIO5,
         Level::Low,
         OutputConfig::default().with_drive_mode(esp_hal::gpio::DriveMode::PushPull),
     );
-    let mut sclk = Output::new(
+    let sclk = Output::new(
         _peripherals.GPIO7,
         Level::Low,
         OutputConfig::default().with_drive_mode(esp_hal::gpio::DriveMode::PushPull),
@@ -240,16 +242,34 @@ fn main() -> ! {
     sdat.set_output_enable(true);
     sdat.set_low();
 
-    let delay = Delay::new();
-    let time_setup_start: u32 = 1000; // ns
-    let time_setup_hold: u32 = 150; // ns
-    let time_clk_low: u32 = 200; // us
-    let time_clk_high: u32 = 200; // us
+    let mut usb_serial = UsbSerialJtag::new(_peripherals.USB_DEVICE);
+    info!("Hello ");
 
-    let byte1: u8 = 0x61;
-    let mut addr: u16 = 128;
-    let mut readed: u8;
-    let mut mem: [u8; 128] = [0; 128];
+    let mut rx_buf = [0u8; 64];
+
+    loop {
+        // 3. 수신 (Read): USB 버퍼에서 데이터 읽어오기 (Non-blocking)
+        let byte = usb_serial.read_byte();
+
+        match byte {
+            Ok(T) => {
+                usb_serial.write_char('d');
+                if (T as char) == 'z' {
+                    info!("im out");
+                    break;
+                }
+            }
+            Ok(127) => {
+                break;
+            }
+            Err(E) => {
+
+                // 수신 데이터가 없으면 루프 돌며 대기
+            }
+        }
+    }
+
+    let delay = Delay::new();
     info!("Hello");
 
     let len = 128;
