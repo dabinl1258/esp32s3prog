@@ -13,10 +13,12 @@ esp-hal = { version = "~1.1.0", features = ["defmt", "esp32c6", "unstable"] }
 
 
 defmt                  = "1.0.1"
+
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["defmt", "esp32c6"] }
 
 critical-section = "1.2.0"
-esp-println      = { version = "0.17.0", features = ["defmt-espflash", "esp32c6"] }
+#esp-println = { version = "0.17.0", default-features = false, features = ["esp32c6", "log-04",  "uart"] }
+esp-println      = { version = "0.17.0", features = ["defmt-espflash", "esp32c6", "no-op" ], default-features = false }
 embedded-hal = "1.0.0"
 
 

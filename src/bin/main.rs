@@ -221,6 +221,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let _peripherals = esp_hal::init(config);
+    info!("Hello");
+
     let reset = Output::new(
         _peripherals.GPIO4,
         Level::High,
@@ -243,19 +245,19 @@ fn main() -> ! {
     sdat.set_low();
 
     let mut usb_serial = UsbSerialJtag::new(_peripherals.USB_DEVICE);
-    info!("Hello ");
 
     let mut rx_buf = [0u8; 64];
 
+    let delay = Delay::new();
+
     loop {
-        // 3. 수신 (Read): USB 버퍼에서 데이터 읽어오기 (Non-blocking)
         let byte = usb_serial.read_byte();
 
         match byte {
             Ok(T) => {
-                usb_serial.write_char('d');
+                usb_serial.write_char(T as char);
+
                 if (T as char) == 'z' {
-                    info!("im out");
                     break;
                 }
             }
@@ -263,14 +265,12 @@ fn main() -> ! {
                 break;
             }
             Err(E) => {
+                delay.delay_millis(10);
 
                 // 수신 데이터가 없으면 루프 돌며 대기
             }
         }
     }
-
-    let delay = Delay::new();
-    info!("Hello");
 
     let len = 128;
 
@@ -298,9 +298,5 @@ fn main() -> ! {
 
     s3.init();
     s3.enter_program_mode();
-    loop {
-        delay.delay_millis(100);
-    }
-
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.1.0/examples
 }
