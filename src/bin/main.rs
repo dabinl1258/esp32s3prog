@@ -11,7 +11,9 @@
 fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
+use core::convert::Infallible;
 use core::fmt::Write;
+use core::future::ready;
 
 //use core::fmt::DebugList;
 //use embedded_hal::delay::DelayNs;
@@ -19,12 +21,15 @@ use esp_hal::delay::Delay;
 
 use defmt::info;
 
+use embedded_cli::Command;
+use embedded_cli::cli::CliBuilder;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Flex, Level, Output, OutputConfig};
-use esp_hal::usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx, UsbSerialJtagTx};
-use esp_hal::{main, usb_serial_jtag};
+use esp_hal::main;
+use esp_hal::usb_serial_jtag::UsbSerialJtag;
 use esp_println as _;
 
+const MEM_SIZE: usize = 32768usize;
 struct S3interface<'a> {
     reset: Output<'a>,
     vpp: Output<'a>,
@@ -49,10 +54,10 @@ impl<'a> S3interface<'a> {
             sdat,
             time_setup_start: 100,
             time_setup_hold: 100,
-            time_clk_low: 100,
-            time_clk_high: 100,
-            time_dummy_low: 100,
-            time_dummy_high: 100,
+            time_clk_low: 200,
+            time_clk_high: 200,
+            time_dummy_low: 200,
+            time_dummy_high: 200,
             delay: Delay::new(),
         }
     }
@@ -88,7 +93,7 @@ impl<'a> S3interface<'a> {
         self.delay.delay_micros(self.time_dummy_high);
     }
 
-    pub fn read(&mut self, addr: u16, len: usize) -> [u8; 1024] {
+    pub fn read(&mut self, addr: u16, len: usize) -> [u8; MEM_SIZE] {
         let byte1: u8 = 0x61u8;
         self.send_byte(byte1);
         self.send_byte((addr >> 8) as u8);
@@ -123,7 +128,7 @@ impl<'a> S3interface<'a> {
             }
         }*/
 
-        let mut mem: [u8; 1024] = [0; 1024];
+        let mut mem: [u8; MEM_SIZE] = [0; MEM_SIZE];
         for i in 0..len {
             mem[i] = self.read_byte();
             //info!("{}", mem[i]);
@@ -175,6 +180,20 @@ impl<'a> S3interface<'a> {
         self.send_byte(0xFF);
         self.stop_condition();
     }
+    pub fn write_all(&mut self, addr: usize, bytes: [u8; MEM_SIZE], len: usize) {
+        self.start_condition();
+        self.send_byte(0x00);
+        self.send_byte((addr >> 8) as u8);
+        self.send_byte(addr as u8);
+
+        for idx in 0..len {
+            let byte = bytes[idx];
+            self.send_byte(byte);
+        }
+
+        self.send_byte(0xFF);
+        self.stop_condition();
+    }
     pub fn erase(&mut self) {
         self.start_condition();
         self.send_byte(0xE0);
@@ -217,6 +236,45 @@ esp_bootloader_esp_idf::esp_app_desc!();
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
 )]
+#[derive(Command, Debug)]
+enum BaseCommand {
+    Mem {
+        addr: u16,
+        len: usize,
+    },
+    Init,
+    Reset,
+    Write {
+        addr: u16,
+        byte: u8,
+    },
+    Crc,
+    Upload {
+        size: usize,
+    },
+    Download,
+    Flash {
+        addr: usize,
+        size: usize,
+    },
+    Erase,
+    Readbyte {
+        addr: u16,
+        len: usize,
+    },
+    Status,
+    /// 두 수의 합 계산 (테스트용)
+    Add {
+        a: i32,
+        b: i32,
+    },
+    Auto,
+    Verify {
+        addr: usize,
+        size: usize,
+    },
+}
+
 #[main]
 fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
@@ -245,58 +303,175 @@ fn main() -> ! {
     sdat.set_low();
 
     let mut usb_serial = UsbSerialJtag::new(_peripherals.USB_DEVICE);
-
-    let mut rx_buf = [0u8; 64];
-
+    let (mut rx, mut tx) = usb_serial.split();
     let delay = Delay::new();
-
-    loop {
-        let byte = usb_serial.read_byte();
-
-        match byte {
-            Ok(T) => {
-                usb_serial.write_char(T as char);
-
-                if (T as char) == 'z' {
-                    break;
-                }
-            }
-            Ok(127) => {
-                break;
-            }
-            Err(E) => {
-                delay.delay_millis(10);
-
-                // 수신 데이터가 없으면 루프 돌며 대기
-            }
-        }
-    }
 
     let len = 128;
 
     let mut s3 = S3interface::new(reset, vpp, sclk, sdat);
-    s3.init();
-    s3.enter_program_mode();
 
-    //    s3.erase();
-    s3.init();
-    s3.enter_program_mode();
+    let mut command_buffer = [0u8; 550];
+    let mut history_buffer = [0u8; 550];
+    let mut flash_buffer = [0u8; MEM_SIZE];
 
-    for addr in 0..100 {
-        s3.init();
-        s3.enter_program_mode();
-        s3.write(addr, 0xaa);
+    let mut cli = CliBuilder::default()
+        .writer(&mut tx)
+        .command_buffer(command_buffer)
+        .history_buffer(history_buffer)
+        .build()
+        .ok()
+        .unwrap();
+
+    loop {
+        // USB로부터 바이트를 꺼내서 CLI 프로세서에 전달
+
+        while let Ok(byte) = rx.read_byte() {
+            let _ = cli.process_byte::<BaseCommand, _>(
+                byte,
+                &mut BaseCommand::processor(|cli, command| {
+                    match command {
+                        BaseCommand::Erase => {
+                            s3.init();
+                            s3.enter_program_mode();
+                            s3.erase();
+                            s3.init();
+                        }
+                        BaseCommand::Init => {
+                            s3.init();
+                        }
+                        BaseCommand::Reset => {
+                            writeln!(cli.writer(), "reset").ok();
+                        }
+                        BaseCommand::Write { addr, byte } => {
+                            s3.init();
+                            s3.enter_program_mode();
+                            s3.write(addr, byte);
+                            s3.stop_condition();
+                            writeln!(cli.writer(), "write").ok();
+                        }
+                        BaseCommand::Readbyte { addr, len } => {
+                            s3.init();
+                            s3.enter_program_mode();
+                            s3.start_condition();
+                            let mem = s3.read(addr, len);
+                            s3.stop_condition();
+
+                            for idx in 0..len {
+                                writeln!(cli.writer(), "{}", mem[idx]).ok();
+                            }
+
+                            writeln!(cli.writer(), "read").ok();
+                        }
+                        BaseCommand::Mem { addr, len } => {
+                            let addr = addr as usize;
+                            for idx in addr..(addr + len) {
+                                writeln!(cli.writer(), "{}", flash_buffer[idx]).ok();
+                            }
+
+                            writeln!(cli.writer(), "read").ok();
+                        }
+                        BaseCommand::Status => {
+                            writeln!(cli.writer(), "Native USB CDC CLI 정상 작동 중! 🐻").ok();
+                        }
+
+                        BaseCommand::Add { a, b } => {
+                            writeln!(cli.writer(), "계산 결과: {} + {} = {}", a, b, a + b).ok();
+                        }
+                        BaseCommand::Auto => {
+                            s3.init();
+                            s3.enter_program_mode();
+
+                            s3.erase();
+                            s3.init();
+                            s3.enter_program_mode();
+
+                            for addr in 0..100 {
+                                s3.init();
+                                s3.enter_program_mode();
+                                s3.write(addr, 0xaa);
+                            }
+                            for addr in 0..1 {
+                                s3.init();
+                                s3.enter_program_mode();
+                                s3.start_condition();
+                                let mem = s3.read(addr, len);
+
+                                for idx in 0..len {
+                                    writeln!(cli.writer(), "{}", mem[idx]).ok();
+                                }
+                                //writeln!(cli.writer(), "{}", mem[0..128]).ok();
+                                s3.stop_condition();
+                            }
+                        }
+                        BaseCommand::Upload { size } => {
+                            let mut idx = 0usize;
+                            loop {
+                                let byte = rx.read_byte();
+                                match byte {
+                                    Ok(byte) => {
+                                        flash_buffer[idx] = byte;
+                                        idx += 1;
+                                        if idx > MEM_SIZE {
+                                            break;
+                                        }
+                                        if idx >= size {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        delay.delay_micros(1);
+                                    }
+                                }
+                            }
+                        }
+                        BaseCommand::Flash { addr, size } => {
+                            s3.init();
+                            s3.enter_program_mode();
+                            s3.write_all(addr, flash_buffer, size);
+                        }
+                        BaseCommand::Download => {}
+                        BaseCommand::Crc => {}
+                        BaseCommand::Verify { addr, size } => {
+                            s3.init();
+                            s3.enter_program_mode();
+                            let addr = addr as u16;
+                            s3.start_condition();
+                            let read = s3.read(addr, size);
+                            if flash_buffer[0..size] == read[0..size] {
+                                writeln!(cli.writer(), "verify ok").ok();
+                            } else {
+                                writeln!(cli.writer(), "verify false").ok();
+                            }
+                        }
+                    }
+                    Ok::<(), Infallible>(())
+                }),
+            );
+        }
+
+        delay.delay_millis(10);
     }
-    for addr in 0..1 {
-        s3.init();
-        s3.enter_program_mode();
-        s3.start_condition();
-        let mem = s3.read(addr, len);
-        info!("{}", mem[0..128]);
-        s3.stop_condition();
-    }
+    // s3.init();
+    // s3.enter_program_mode();
 
-    s3.init();
-    s3.enter_program_mode();
+    // //    s3.erase();
+    // s3.init();
+    // s3.enter_program_mode();
+
+    // for addr in 0..100 {
+    //     s3.init();
+    //     s3.enter_program_mode();
+    //     s3.write(addr, 0xaa);
+    // }
+    // for addr in 0..1 {
+    //     s3.init();
+    //     s3.enter_program_mode();
+    //     s3.start_condition();
+    //     let mem = s3.read(addr, len);
+    //     info!("{}", mem[0..128]);
+    //     s3.stop_condition();
+    // }
+    // s3.init();
+    // s3.enter_program_mode();
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.1.0/examples
 }

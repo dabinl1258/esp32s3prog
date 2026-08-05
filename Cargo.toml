@@ -20,6 +20,10 @@ critical-section = "1.2.0"
 #esp-println = { version = "0.17.0", default-features = false, features = ["esp32c6", "log-04",  "uart"] }
 esp-println      = { version = "0.17.0", features = ["defmt-espflash", "esp32c6", "no-op" ], default-features = false }
 embedded-hal = "1.0.0"
+embedded-cli = "0.2.1"
+embedded-io = "0.6.1"
+ufmt = "0.2.0"
+
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
