@@ -6,28 +6,47 @@
     holding buffers for the duration of a data transfer."
 )]
 #![deny(clippy::large_stack_frames)]
+extern crate alloc;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
-use core::convert::Infallible;
-use core::fmt::Write;
-use core::future::ready;
+use embassy_executor::Spawner;
+use embassy_time::{Duration, Timer};
+use esp_backtrace as _;
 
+use esp_alloc as _;
 //use core::fmt::DebugList;
 //use embedded_hal::delay::DelayNs;
-use esp_hal::delay::Delay;
-
 use defmt::info;
-
-use embedded_cli::Command;
-use embedded_cli::cli::CliBuilder;
+use embassy_net::{
+    Runner, StackResources,
+    dns::DnsSocket,
+    tcp::client::{TcpClient, TcpClientState},
+};
 use esp_hal::clock::CpuClock;
+use esp_hal::delay::Delay;
 use esp_hal::gpio::{Flex, Level, Output, OutputConfig};
-use esp_hal::main;
-use esp_hal::usb_serial_jtag::UsbSerialJtag;
+use esp_hal::interrupt::software::SoftwareInterruptControl;
+use esp_hal::ram;
+use esp_hal::rng::Rng;
+use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
+use esp_println::println;
+use esp_radio::wifi::{
+    Config, ControllerConfig, Interface, WifiController, scan::ScanConfig, sta::StationConfig,
+};
+const SSID: &str = env!("SSID");
+const PASSWORD: &str = env!("PASSWORD");
+macro_rules! mk_static {
+    ($t:ty,$val:expr) => {{
+        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        #[deny(unused_attributes)]
+        let x = STATIC_CELL.uninit().write(($val));
+        x
+    }};
+}
 
 const MEM_SIZE: usize = 32768usize;
 struct S3interface<'a> {
@@ -98,36 +117,6 @@ impl<'a> S3interface<'a> {
         self.send_byte(byte1);
         self.send_byte((addr >> 8) as u8);
         self.send_byte(addr as u8);
-        /*
-        for i in (0..=7).rev() {
-            self.sclk.set_low();
-            if ((0x01 << i) & byte1) != 0 {
-                self.sdat.set_high();
-            } else {
-                self.sdat.set_low();
-            }
-
-            self.delay.delay_micros(self.time_clk_low);
-            self.sclk.set_high();
-            self.delay.delay_micros(self.time_clk_high);
-        }*/
-        //self.dummy_clock();
-        /*for i in (0..=15).rev() {
-            self.sclk.set_low();
-            if ((0x01u16 << i) & addr) != 0 {
-                self.sdat.set_high();
-            } else {
-                self.sdat.set_low();
-            }
-
-            self.delay.delay_micros(self.time_dummy_low);
-            self.sclk.set_high();
-            self.delay.delay_micros(self.time_dummy_high);
-            if i == 8 || i == 0 {
-                self.dummy_clock();
-            }
-        }*/
-
         let mut mem: [u8; MEM_SIZE] = [0; MEM_SIZE];
         for i in 0..len {
             mem[i] = self.read_byte();
@@ -231,54 +220,40 @@ impl<'a> S3interface<'a> {
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
-
-#[allow(
-    clippy::large_stack_frames,
-    reason = "it's not unusual to allocate larger buffers etc. in main"
-)]
-#[derive(Command, Debug)]
-enum BaseCommand {
-    Mem {
-        addr: u16,
-        len: usize,
-    },
-    Init,
-    Reset,
-    Write {
-        addr: u16,
-        byte: u8,
-    },
-    Crc,
-    Upload {
-        size: usize,
-    },
-    Download,
-    Flash {
-        addr: usize,
-        size: usize,
-    },
-    Erase,
-    Readbyte {
-        addr: u16,
-        len: usize,
-    },
-    Status,
-    /// 두 수의 합 계산 (테스트용)
-    Add {
-        a: i32,
-        b: i32,
-    },
-    Auto,
-    Verify {
-        addr: usize,
-        size: usize,
-    },
+#[cfg(feature = "alloc-hooks")]
+#[unsafe(no_mangle)]
+unsafe extern "Rust" fn _esp_alloc_alloc(
+    _heap: &EspHeap,
+    _caps: EnumSet<MemoryCapability>,
+    ptr: usize,
+    size: usize,
+) {
+    println!("Allocated {} bytes: {:x}", size, ptr);
 }
 
-#[main]
-fn main() -> ! {
+#[cfg(feature = "alloc-hooks")]
+#[unsafe(no_mangle)]
+unsafe extern "Rust" fn _esp_alloc_dealloc(_heap: &EspHeap, ptr: usize, size: usize) {
+    println!("Deallocated {} bytes: {:x}", size, ptr);
+}
+
+// #[allow(
+//     clippy::large_stack_frames,
+//     reason = "it's not unusual to allocate larger buffers etc. in main"
+// )]
+//#[main]
+//[esp_hal_embassy::main]
+#[esp_rtos::main]
+async fn main(spawner: Spawner) {
+    esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 64 * 1024);
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let _peripherals = esp_hal::init(config);
+
+    let mut timg0 = TimerGroup::new(_peripherals.TIMG0);
+    timg0.wdt.disable();
+    let sw_int = SoftwareInterruptControl::new(_peripherals.SW_INTERRUPT);
+
     info!("Hello");
 
     let reset = Output::new(
@@ -301,177 +276,85 @@ fn main() -> ! {
     sdat.set_input_enable(false);
     sdat.set_output_enable(true);
     sdat.set_low();
-
-    let mut usb_serial = UsbSerialJtag::new(_peripherals.USB_DEVICE);
-    let (mut rx, mut tx) = usb_serial.split();
     let delay = Delay::new();
-
-    let len = 128;
-
     let mut s3 = S3interface::new(reset, vpp, sclk, sdat);
 
-    let mut command_buffer = [0u8; 550];
-    let mut history_buffer = [0u8; 550];
-    let mut flash_buffer = [0u8; MEM_SIZE];
+    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+    let station_config = Config::Station(
+        StationConfig::default()
+            .with_ssid(SSID)
+            .with_password(PASSWORD.into()),
+    );
+    info!("init wifi begin");
+    let (mut controller, interfaces) = esp_radio::wifi::new(
+        _peripherals.WIFI,
+        ControllerConfig::default().with_initial_config(station_config),
+    )
+    .unwrap();
 
-    let mut cli = CliBuilder::default()
-        .writer(&mut tx)
-        .command_buffer(command_buffer)
-        .history_buffer(history_buffer)
-        .build()
-        .ok()
-        .unwrap();
+    info!("Wifi configured and started!");
+    let wifi_interface = interfaces.station;
+
+    let config = embassy_net::Config::dhcpv4(Default::default());
+
+    let rng = Rng::new();
+    let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+
+    // Init network stack
+    let (stack, runner) = embassy_net::new(
+        wifi_interface,
+        config,
+        mk_static!(StackResources<3>, StackResources::<3>::new()),
+        seed,
+    );
+    info!("delay for power");
+    delay.delay_millis(800);
+    info!("Scan");
+    let scan_config = ScanConfig::default().with_max(1);
+    let result = controller.scan_async(&scan_config).await.unwrap();
+    for ap in result {
+        println!("{:?}", ap);
+    }
+
+    spawner.spawn(connection(controller).unwrap());
+    spawner.spawn(net_task(runner).unwrap());
+
+    stack.wait_config_up().await;
+
+    if let Some(config) = stack.config_v4() {
+        println!("Got IP: {}", config.address);
+    }
 
     loop {
-        // USB로부터 바이트를 꺼내서 CLI 프로세서에 전달
-
-        while let Ok(byte) = rx.read_byte() {
-            let _ = cli.process_byte::<BaseCommand, _>(
-                byte,
-                &mut BaseCommand::processor(|cli, command| {
-                    match command {
-                        BaseCommand::Erase => {
-                            s3.init();
-                            s3.enter_program_mode();
-                            s3.erase();
-                            s3.init();
-                        }
-                        BaseCommand::Init => {
-                            s3.init();
-                        }
-                        BaseCommand::Reset => {
-                            writeln!(cli.writer(), "reset").ok();
-                        }
-                        BaseCommand::Write { addr, byte } => {
-                            s3.init();
-                            s3.enter_program_mode();
-                            s3.write(addr, byte);
-                            s3.stop_condition();
-                            writeln!(cli.writer(), "write").ok();
-                        }
-                        BaseCommand::Readbyte { addr, len } => {
-                            s3.init();
-                            s3.enter_program_mode();
-                            s3.start_condition();
-                            let mem = s3.read(addr, len);
-                            s3.stop_condition();
-
-                            for idx in 0..len {
-                                writeln!(cli.writer(), "{}", mem[idx]).ok();
-                            }
-
-                            writeln!(cli.writer(), "read").ok();
-                        }
-                        BaseCommand::Mem { addr, len } => {
-                            let addr = addr as usize;
-                            for idx in addr..(addr + len) {
-                                writeln!(cli.writer(), "{}", flash_buffer[idx]).ok();
-                            }
-
-                            writeln!(cli.writer(), "read").ok();
-                        }
-                        BaseCommand::Status => {
-                            writeln!(cli.writer(), "Native USB CDC CLI 정상 작동 중! 🐻").ok();
-                        }
-
-                        BaseCommand::Add { a, b } => {
-                            writeln!(cli.writer(), "계산 결과: {} + {} = {}", a, b, a + b).ok();
-                        }
-                        BaseCommand::Auto => {
-                            s3.init();
-                            s3.enter_program_mode();
-
-                            s3.erase();
-                            s3.init();
-                            s3.enter_program_mode();
-
-                            for addr in 0..100 {
-                                s3.init();
-                                s3.enter_program_mode();
-                                s3.write(addr, 0xaa);
-                            }
-                            for addr in 0..1 {
-                                s3.init();
-                                s3.enter_program_mode();
-                                s3.start_condition();
-                                let mem = s3.read(addr, len);
-
-                                for idx in 0..len {
-                                    writeln!(cli.writer(), "{}", mem[idx]).ok();
-                                }
-                                //writeln!(cli.writer(), "{}", mem[0..128]).ok();
-                                s3.stop_condition();
-                            }
-                        }
-                        BaseCommand::Upload { size } => {
-                            let mut idx = 0usize;
-                            loop {
-                                let byte = rx.read_byte();
-                                match byte {
-                                    Ok(byte) => {
-                                        flash_buffer[idx] = byte;
-                                        idx += 1;
-                                        if idx > MEM_SIZE {
-                                            break;
-                                        }
-                                        if idx >= size {
-                                            break;
-                                        }
-                                    }
-                                    Err(_) => {
-                                        delay.delay_micros(1);
-                                    }
-                                }
-                            }
-                        }
-                        BaseCommand::Flash { addr, size } => {
-                            s3.init();
-                            s3.enter_program_mode();
-                            s3.write_all(addr, flash_buffer, size);
-                        }
-                        BaseCommand::Download => {}
-                        BaseCommand::Crc => {}
-                        BaseCommand::Verify { addr, size } => {
-                            s3.init();
-                            s3.enter_program_mode();
-                            let addr = addr as u16;
-                            s3.start_condition();
-                            let read = s3.read(addr, size);
-                            if flash_buffer[0..size] == read[0..size] {
-                                writeln!(cli.writer(), "verify ok").ok();
-                            } else {
-                                writeln!(cli.writer(), "verify false").ok();
-                            }
-                        }
-                    }
-                    Ok::<(), Infallible>(())
-                }),
-            );
-        }
-
         delay.delay_millis(10);
     }
-    // s3.init();
-    // s3.enter_program_mode();
+}
 
-    // //    s3.erase();
-    // s3.init();
-    // s3.enter_program_mode();
+#[embassy_executor::task]
+async fn connection(mut controller: WifiController<'static>) {
+    info!("start connection task");
 
-    // for addr in 0..100 {
-    //     s3.init();
-    //     s3.enter_program_mode();
-    //     s3.write(addr, 0xaa);
-    // }
-    // for addr in 0..1 {
-    //     s3.init();
-    //     s3.enter_program_mode();
-    //     s3.start_condition();
-    //     let mem = s3.read(addr, len);
-    //     info!("{}", mem[0..128]);
-    //     s3.stop_condition();
-    // }
-    // s3.init();
-    // s3.enter_program_mode();
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.1.0/examples
+    loop {
+        info!("About to connect...");
+
+        match controller.connect_async().await {
+            Ok(info) => {
+                println!("Wifi connected to {:?}", info);
+
+                // wait until we're no longer connected
+                let info = controller.wait_for_disconnect_async().await.ok();
+                println!("Disconnected: {:?}", info);
+            }
+            Err(e) => {
+                println!("Failed to connect to wifi: {e:?}");
+            }
+        }
+
+        Timer::after(Duration::from_millis(5000)).await
+    }
+}
+
+#[embassy_executor::task]
+async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
+    runner.run().await
 }
