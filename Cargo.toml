@@ -21,7 +21,7 @@ critical-section = "1.2.0"
 esp-println      = { version = "0.17.0", features = ["defmt-espflash", "esp32c6", "uart" ], default-features = false }
 embedded-hal = "1.0.0"
 embedded-cli = "0.2.1"
-embedded-io = "0.6.1"
+embedded-io = "0.7.1"
 ufmt = "0.2.0"
 # embassy-net = "0.9.1"
 embassy-executor = "0.10.0"
@@ -30,9 +30,11 @@ esp-radio = {version ="0.18.0", features = ["esp32c6", "wifi", "esp-alloc"]}
 esp-phy = { version = "0.2.0", features = ["esp32c6"] }
 esp-alloc = { version = "0.10.0", features = ["esp32c6"] }
 embassy-net = {version = "0.9.1", features =  ["proto-ipv4", "dhcpv4", "medium-ethernet","dns", "tcp" , "defmt"]}
+embassy-sync = "0.7.2"
 embassy-time = "0.5.1"
 static_cell = "2.1.1"
 esp-backtrace = {version = "0.19.0", features = ["esp32c6", "defmt"]}
+picoserve = {version = "0.19", default-features = false, features = ["embassy"]}
 
 
 

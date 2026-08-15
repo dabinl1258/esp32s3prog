@@ -8,10 +8,9 @@
 #![deny(clippy::large_stack_frames)]
 extern crate alloc;
 
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
+
+
+use alloc::format;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
@@ -21,8 +20,9 @@ use esp_alloc as _;
 //use embedded_hal::delay::DelayNs;
 use defmt::info;
 use embassy_net::{
-    Runner, StackResources,
+    Runner, Stack, StackResources,
     dns::DnsSocket,
+    tcp::TcpSocket,
     tcp::client::{TcpClient, TcpClientState},
 };
 use esp_hal::clock::CpuClock;
@@ -32,11 +32,24 @@ use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::ram;
 use esp_hal::rng::Rng;
 use esp_hal::timer::timg::TimerGroup;
+
 use esp_println as _;
 use esp_println::println;
 use esp_radio::wifi::{
     Config, ControllerConfig, Interface, WifiController, scan::ScanConfig, sta::StationConfig,
 };
+
+use picoserve::request::RequestBodyReader;
+use picoserve::response::IntoResponse;
+use picoserve::routing::get;
+use picoserve::{AppBuilder, io, request::Request, routing::get_service};
+use picoserve::{AppRouter, io::Read};
+
+#[panic_handler]
+fn panic(panic: &core::panic::PanicInfo) -> ! {
+    println!("Panic {}", panic);
+    loop {}
+}
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
 macro_rules! mk_static {
@@ -237,6 +250,9 @@ unsafe extern "Rust" fn _esp_alloc_dealloc(_heap: &EspHeap, ptr: usize, size: us
     println!("Deallocated {} bytes: {:x}", size, ptr);
 }
 
+#[embassy_executor::task]
+async fn wifi_task() {}
+
 // #[allow(
 //     clippy::large_stack_frames,
 //     reason = "it's not unusual to allocate larger buffers etc. in main"
@@ -319,20 +335,32 @@ async fn main(spawner: Spawner) {
     spawner.spawn(connection(controller).unwrap());
     spawner.spawn(net_task(runner).unwrap());
 
-    stack.wait_config_up().await;
-
-    if let Some(config) = stack.config_v4() {
-        println!("Got IP: {}", config.address);
-    }
+    println!("Now try connect wifi");
+    println!("ID : {}", SSID);
+    println!("PW : {}", PASSWORD);
 
     loop {
-        delay.delay_millis(10);
+        if let Some(config) = stack.config_v4() {
+            println!("Got IP: {}", config.address);
+            break;
+        }
+        Timer::after_secs(5).await;
+        println!("Wait for secs ... ");
+    }
+
+    static STACK: static_cell::StaticCell<embassy_net::Stack> = static_cell::StaticCell::new();
+    let stack: &'static embassy_net::Stack = STACK.init(stack);
+    spawner.spawn(web_task(&stack).unwrap());
+
+    loop {
+        Timer::after_secs(10).await;
     }
 }
 
 #[embassy_executor::task]
 async fn connection(mut controller: WifiController<'static>) {
     info!("start connection task");
+    
 
     loop {
         info!("About to connect...");
@@ -357,4 +385,102 @@ async fn connection(mut controller: WifiController<'static>) {
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
     runner.run().await
+}
+struct CalculateHash;
+
+impl picoserve::routing::RequestHandlerService<()> for CalculateHash {
+    async fn call_request_handler_service<
+        R: Read,
+        W: picoserve::response::ResponseWriter<Error = R::Error>,
+    >(
+        &self,
+        (): &(),
+        (): (),
+        mut request: picoserve::request::Request<'_, R>,
+        response_writer: W,
+    ) -> Result<picoserve::ResponseSent, W::Error> {
+        if request.body_connection.content_length() > 2_000_000 {
+            let response = (
+                picoserve::response::StatusCode::PAYLOAD_TOO_LARGE,
+                "The file must be smaller than 2MB",
+            )
+                .write_to(request.body_connection.finalize().await?, response_writer)
+                .await;
+            return response;
+        }
+
+        let timeout = embassy_time::Duration::from_micros(
+            request.body_connection.content_length() as u64 * 10,
+        );
+        let start_time = embassy_time::Instant::now();
+
+        let mut reader = request
+            .body_connection
+            .body()
+            .reader()
+            .with_different_timeout(timeout);
+
+        let mut buffer = [0; 1024];
+        reader.read(&mut buffer).await?;
+        let buffer : &[u8] = &buffer;
+let response = (
+            picoserve::response::StatusCode::OK,
+            buffer, // 혹은 실제 해시 결과 문자열/바이트
+        );
+
+        // 2. body_connection을 finalize()한 연결 객체와 response_writer를 함께 전달
+        response
+            .write_to(request.body_connection.finalize().await?, response_writer)
+            .await
+
+    }
+}
+
+#[embassy_executor::task(pool_size = 2)]
+async fn web_task(stack: &'static Stack<'static>) {
+    // 1. Task 내부에서 직접 router 생성 (impl 반환값이나 type alias 필요 없음)
+
+    let html = picoserve::response::File::html(
+        r#"
+                    <!DOCTYPE html>
+                    <html>
+                    <head><title>ESP32 File Upload</title></head>
+                    <body>
+                        <h2>🐻 곰돌이 서버 파일 업로드 🍯</h2>
+                        <form action="/upload" method="POST" enctype="multipart/form-data">
+                            <input type="file" name="file" /><br><br>
+                            <button type="submit">업로드!</button>
+                        </form>
+                    </body>
+                    </html>
+                    "#,
+    );
+    let router = picoserve::Router::new()
+        .route("/", get_service(html))
+        .route("/health", get(|| async move { "OK" }))
+        .route("/upload", picoserve::routing::post_service(CalculateHash));
+
+    let config = picoserve::Config::new(picoserve::Timeouts {
+        start_read_request: Duration::from_secs(5),
+        read_request: Duration::from_secs(10),
+        persistent_start_read_request: Duration::from_secs(10),
+        write: Duration::from_secs(10),
+    });
+
+    let mut rx_buffer = [0u8; 1024];
+    let mut tx_buffer = [0u8; 1024];
+    let mut http_buffer = [0u8; 1024];
+
+    loop {
+        let mut socket = TcpSocket::new(*stack, &mut rx_buffer, &mut tx_buffer);
+
+        if let Err(e) = socket.accept(80).await {
+            info!("Socket accept error: {:?}", e);
+            continue;
+        }
+
+        let _ = picoserve::Server::new(&router, &config, &mut http_buffer)
+            .serve(socket)
+            .await;
+    }
 }
