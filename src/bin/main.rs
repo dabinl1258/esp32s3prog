@@ -8,8 +8,6 @@
 #![deny(clippy::large_stack_frames)]
 extern crate alloc;
 
-
-
 use alloc::format;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
@@ -360,7 +358,6 @@ async fn main(spawner: Spawner) {
 #[embassy_executor::task]
 async fn connection(mut controller: WifiController<'static>) {
     info!("start connection task");
-    
 
     loop {
         info!("About to connect...");
@@ -422,8 +419,8 @@ impl picoserve::routing::RequestHandlerService<()> for CalculateHash {
 
         let mut buffer = [0; 1024];
         reader.read(&mut buffer).await?;
-        let buffer : &[u8] = &buffer;
-let response = (
+        let buffer: &[u8] = &buffer;
+        let response = (
             picoserve::response::StatusCode::OK,
             buffer, // 혹은 실제 해시 결과 문자열/바이트
         );
@@ -432,7 +429,6 @@ let response = (
         response
             .write_to(request.body_connection.finalize().await?, response_writer)
             .await
-
     }
 }
 
@@ -440,21 +436,7 @@ let response = (
 async fn web_task(stack: &'static Stack<'static>) {
     // 1. Task 내부에서 직접 router 생성 (impl 반환값이나 type alias 필요 없음)
 
-    let html = picoserve::response::File::html(
-        r#"
-                    <!DOCTYPE html>
-                    <html>
-                    <head><title>ESP32 File Upload</title></head>
-                    <body>
-                        <h2>🐻 곰돌이 서버 파일 업로드 🍯</h2>
-                        <form action="/upload" method="POST" enctype="multipart/form-data">
-                            <input type="file" name="file" /><br><br>
-                            <button type="submit">업로드!</button>
-                        </form>
-                    </body>
-                    </html>
-                    "#,
-    );
+    let html = picoserve::response::File::html(include_str!("index.html"));
     let router = picoserve::Router::new()
         .route("/", get_service(html))
         .route("/health", get(|| async move { "OK" }))
