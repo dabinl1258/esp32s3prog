@@ -6,15 +6,13 @@
     holding buffers for the duration of a data transfer."
 )]
 #![deny(clippy::large_stack_frames)]
+#![recursion_limit = "512"]
 extern crate alloc;
-
-use core::any::Any;
-
 use alloc::format;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::mutex::{self, Mutex};
-use embassy_sync::signal::{self, Signal};
+use embassy_sync::mutex::Mutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 
@@ -302,9 +300,8 @@ async fn main(spawner: Spawner) {
     static s3_static: static_cell::StaticCell<S3interface> = static_cell::StaticCell::new();
     let s3: &'static mut S3interface = s3_static.init(s3);
 
-
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
-        spawner.spawn(s3_interface_task(s3).unwrap());
+    spawner.spawn(s3_interface_task(s3).unwrap());
 
     let station_config = Config::Station(
         StationConfig::default()
@@ -400,7 +397,9 @@ async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
 enum RecordType {
     Data,
     Eof,
+    ExtendedSegmentAddress,
     StartSegmentAddress,
+    ExtendedLinearAddress,
     StartLinearAddress,
 }
 
@@ -543,7 +542,7 @@ impl picoserve::routing::RequestHandlerService<()> for UploadProc {
             println!("read size {} ", read_size);
 
             for c in read_str.chars() {
-                println!("read char {} ", c);
+                // println!("read char {} ", c);
                 let c = c as u8;
                 // println!("read char {} ",c);
                 if read_done_flag {
@@ -555,7 +554,7 @@ impl picoserve::routing::RequestHandlerService<()> for UploadProc {
                     HexStage::StartCode => {
                         field_buffer_seek = 0usize;
                         if field_buffer[0] == ':' as u8 {
-                            info!("find start code");
+                            // info!("find start code");
                             stage = HexStage::ByteCount;
                         }
                     }
@@ -563,10 +562,10 @@ impl picoserve::routing::RequestHandlerService<()> for UploadProc {
                         if field_buffer_seek == 2 {
                             let [f, s, _, _] = field_buffer;
                             hex_file.records[record_index].byte_count = str2u8([f, s]).unwrap();
-                            println!(
-                                "record byte count {}",
-                                hex_file.records[record_index].byte_count
-                            );
+                            // println!(
+                            //     "record byte count {}",
+                            //     hex_file.records[record_index].byte_count
+                            // );
                             stage = HexStage::Address;
                             field_buffer_seek = 0usize;
                         }
@@ -583,17 +582,13 @@ impl picoserve::routing::RequestHandlerService<()> for UploadProc {
                             stage = HexStage::Data;
                             let [f, s, _, _] = field_buffer;
                             let record_type = str2u8([f, s]).unwrap();
-                            println!("Record type {}", record_type);
+                            // println!("Record type {}", record_type);
                             let record_type = match record_type {
                                 0u8 => RecordType::Data,
                                 1u8 => RecordType::Eof,
-                                2u8 => {
-                                    panic!("not imple no Extented Segment Address");
-                                }
+                                2u8 => RecordType::ExtendedSegmentAddress,
                                 3u8 => RecordType::StartSegmentAddress,
-                                4u8 => {
-                                    panic!("Not Impl");
-                                }
+                                4u8 => RecordType::ExtendedLinearAddress,
                                 5u8 => RecordType::StartLinearAddress,
                                 _ => {
                                     panic!("Hex file Error")
@@ -706,10 +701,10 @@ async fn web_task(stack: &'static Stack<'static>) {
             continue;
         }
         info!("new socket");
-        let  _= picoserve::Server::new(&router, &config, &mut http_buffer)
+        let _ = picoserve::Server::new(&router, &config, &mut http_buffer)
             .serve(socket)
             .await;
-        
+
         info!(" ?");
     }
 }
@@ -728,24 +723,31 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
                 s3.init();
             }
             WebCommand::Program => {
-                let mut hex_file = HEX_FILE.lock().await;
+                let hex_file = HEX_FILE.lock().await;
                 let mut address = 0u16;
                 let mut record_index = 0usize;
                 s3.init();
                 s3.enter_program_mode();
                 loop {
-
                     match hex_file.records[record_index].record_type {
-                        RecordType::Eof => {
-                            break;
-                        }
                         RecordType::Data => {
                             let addr: usize =
                                 (hex_file.records[record_index].address + address) as usize;
                             let len = hex_file.records[record_index].byte_count as usize;
                             s3.write_all(addr, hex_file.records[record_index].data, len);
                         }
+                        RecordType::Eof => {
+                            break;
+                        }
+                        RecordType::ExtendedSegmentAddress => {
+                            let [a, b, c, d, ..] = hex_file.records[record_index].data;
+                            address = str2u16([a, b, c, d]).unwrap();
+                            address = address << 4;
+                            println!("address changed at {}", address);
+                        }
+
                         RecordType::StartLinearAddress => {}
+                        RecordType::ExtendedLinearAddress => {}
                         RecordType::StartSegmentAddress => {}
                     }
                     record_index += 1;
