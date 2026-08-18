@@ -1,11 +1,75 @@
 <!DOCTYPE html>
 <html>
-	<head><title>ESP32 File Upload</title></head>
-	<body>
-		<h2>F/W 파일 업로드</h2>
-		<form action="/upload" method="POST" enctype="multipart/form-data">
-			<input type="file" name="file"><br><br>
-			<button type="submit">업로드!</button>
-		</form>
-	</body>
+
+<body>
+
+	<input type="file" id="fileInput">
+	<button type="button" onclick="uploadFile()">업로드</button>
+	<button type="button" onclick="program()">Program</button>
+	<button type="button" onclick="erase()">Erase</button>
+	<button type="button" onclick="verify()">Verify</button>
+	<button type="button" onclick="auto()">Auto</button>
+
+	<script>
+		function uploadFile() {
+			const fileInput = document.getElementById('fileInput');
+			const file = fileInput.files[0];
+
+			if (!file) {
+				alert("plz select file!");
+				return;
+			}
+
+			fetch('/upload', {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/octet-stream',
+					'X-File-Name': encodeURIComponent(file.name)
+				},
+				body: file
+			})
+				.then(response => alert("Upload Done!"))
+				.catch(error => alert("Upload Error"));
+		}
+
+		function program() {
+			fetch('/program', {
+				method: 'POST',
+
+			})
+				.then(response => alert("program Done!"))
+				.catch(error => alert("program Error"));
+
+
+		}
+		function erase() {
+			fetch('/erase', {
+				method: 'POST',
+
+			})
+				.then(response => alert("erase Done!"))
+				.catch(error => alert("erase Error"));
+		}
+		function verify() {
+			fetch('/verify', {
+				method: 'POST',
+
+			})
+				.then(response => alert("verify Done!"))
+				.catch(error => alert("verify Error"));
+		}
+		function auto() {
+			fetch('/auto', {
+				method: 'POST',
+
+			})
+				.then(response => alert("auto Done!"))
+				.catch(error => alert("auto Error"));
+
+
+		}
+	</script>
+
+</body>
+
 </html>

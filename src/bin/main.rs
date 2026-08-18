@@ -8,8 +8,13 @@
 #![deny(clippy::large_stack_frames)]
 extern crate alloc;
 
+use core::any::Any;
+
 use alloc::format;
 use embassy_executor::Spawner;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::{self, Mutex};
+use embassy_sync::signal::{self, Signal};
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 
@@ -23,13 +28,13 @@ use embassy_net::{
     tcp::TcpSocket,
     tcp::client::{TcpClient, TcpClientState},
 };
-use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Flex, Level, Output, OutputConfig};
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::ram;
 use esp_hal::rng::Rng;
 use esp_hal::timer::timg::TimerGroup;
+use esp_hal::{clock::CpuClock, riscv::register::hpmcounter15h::read};
 
 use esp_println as _;
 use esp_println::println;
@@ -39,7 +44,8 @@ use esp_radio::wifi::{
 
 use picoserve::request::RequestBodyReader;
 use picoserve::response::IntoResponse;
-use picoserve::routing::get;
+use picoserve::routing::post_service;
+use picoserve::routing::{get, post};
 use picoserve::{AppBuilder, io, request::Request, routing::get_service};
 use picoserve::{AppRouter, io::Read};
 
@@ -59,7 +65,7 @@ macro_rules! mk_static {
     }};
 }
 
-const MEM_SIZE: usize = 32768usize;
+const MEM_SIZE: usize = 255usize;
 struct S3interface<'a> {
     reset: Output<'a>,
     vpp: Output<'a>,
@@ -291,9 +297,15 @@ async fn main(spawner: Spawner) {
     sdat.set_output_enable(true);
     sdat.set_low();
     let delay = Delay::new();
+
     let mut s3 = S3interface::new(reset, vpp, sclk, sdat);
+    static s3_static: static_cell::StaticCell<S3interface> = static_cell::StaticCell::new();
+    let s3: &'static mut S3interface = s3_static.init(s3);
+
 
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+        spawner.spawn(s3_interface_task(s3).unwrap());
+
     let station_config = Config::Station(
         StationConfig::default()
             .with_ssid(SSID)
@@ -383,9 +395,94 @@ async fn connection(mut controller: WifiController<'static>) {
 async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
     runner.run().await
 }
-struct CalculateHash;
 
-impl picoserve::routing::RequestHandlerService<()> for CalculateHash {
+#[derive(Copy, Clone, PartialEq)]
+enum RecordType {
+    Data,
+    Eof,
+    StartSegmentAddress,
+    StartLinearAddress,
+}
+
+#[derive(Copy, Clone)]
+pub struct HexRecord {
+    pub record_type: RecordType,
+    pub byte_count: u8,
+    pub address: u16,
+    pub data: [u8; 255],
+}
+impl HexRecord {
+    pub const fn new() -> HexRecord {
+        HexRecord {
+            record_type: (RecordType::Eof),
+            byte_count: (0u8),
+            address: (0u16),
+            data: ([0u8; 255]),
+        }
+    }
+}
+
+const RECORDS: usize = 100usize;
+struct HexFile {
+    pub records: [HexRecord; RECORDS],
+    pub record_count: usize,
+}
+
+impl HexFile {
+    pub const fn new() -> HexFile {
+        HexFile {
+            records: ([HexRecord::new(); RECORDS]),
+            record_count: 0usize,
+        }
+    }
+}
+static HEX_FILE: Mutex<CriticalSectionRawMutex, HexFile> = Mutex::new(HexFile::new());
+
+enum WebCommand {
+    Program,
+    Erase,
+    Verify,
+    Auto,
+}
+
+static WEB_COMMAND_SIGNAL: Signal<CriticalSectionRawMutex, WebCommand> = Signal::new();
+enum HexStage {
+    StartCode,
+    ByteCount,
+    Address,
+    RecordType,
+    Data,
+    Checksum,
+}
+fn u8char2num16(ch: u8) -> Option<u16> {
+    Some(u8char2num(ch).unwrap() as u16)
+}
+fn u8char2num(ch: u8) -> Option<u8> {
+    if ch >= '0' as u8 || ch <= '9' as u8 {
+        return Some(ch - ('0' as u8));
+    }
+    if ch >= 'a' as u8 || ch <= 'f' as u8 {
+        return Some(ch - ('a' as u8));
+    }
+    if ch >= 'A' as u8 || ch <= 'F' as u8 {
+        return Some(ch - ('A' as u8));
+    }
+    None
+}
+fn str2u8(array: [u8; 2]) -> Option<u8> {
+    Some((u8char2num(array[0]).unwrap() << 4) + (u8char2num(array[1]).unwrap()))
+}
+fn str2u16(array: [u8; 4]) -> Option<u16> {
+    Some(
+        (u8char2num16(array[0]).unwrap() << 12)
+            + (u8char2num16(array[1]).unwrap() << 8)
+            + (u8char2num16(array[2]).unwrap() << 4)
+            + u8char2num16(array[3]).unwrap(),
+    )
+}
+struct UploadProc;
+
+impl picoserve::routing::RequestHandlerService<()> for UploadProc {
     async fn call_request_handler_service<
         R: Read,
         W: picoserve::response::ResponseWriter<Error = R::Error>,
@@ -417,12 +514,132 @@ impl picoserve::routing::RequestHandlerService<()> for CalculateHash {
             .reader()
             .with_different_timeout(timeout);
 
-        let mut buffer = [0; 1024];
-        reader.read(&mut buffer).await?;
-        let buffer: &[u8] = &buffer;
+        let mut read_buffer = [0; 512];
+        let mut hex_file = HEX_FILE.lock().await;
+        let mut seek: usize;
+        let mut current_record = 0usize;
+        let mut stage: HexStage = HexStage::StartCode;
+        let mut readed_byte_count: usize;
+        let mut field_buffer: [u8; 4] = [0u8; 4];
+        let mut field_buffer_seek = 0usize;
+        let mut record_index: usize = 0usize;
+        let mut data_seek: usize = 0usize;
+        let mut read_done_flag: bool = false;
+
+        info!("Start read");
+        loop {
+            let read_size = reader.read(&mut read_buffer).await?;
+            seek = 0usize;
+
+            if read_done_flag {
+                break;
+            }
+            if read_size == 0 {
+                break;
+            }
+            let read_buf = &read_buffer[..read_size];
+            let read_str = core::str::from_utf8(read_buf).unwrap();
+
+            println!("read size {} ", read_size);
+
+            for c in read_str.chars() {
+                println!("read char {} ", c);
+                let c = c as u8;
+                // println!("read char {} ",c);
+                if read_done_flag {
+                    break;
+                }
+                field_buffer[field_buffer_seek] = c;
+                field_buffer_seek = field_buffer_seek + 1;
+                match stage {
+                    HexStage::StartCode => {
+                        field_buffer_seek = 0usize;
+                        if field_buffer[0] == ':' as u8 {
+                            info!("find start code");
+                            stage = HexStage::ByteCount;
+                        }
+                    }
+                    HexStage::ByteCount => {
+                        if field_buffer_seek == 2 {
+                            let [f, s, _, _] = field_buffer;
+                            hex_file.records[record_index].byte_count = str2u8([f, s]).unwrap();
+                            println!(
+                                "record byte count {}",
+                                hex_file.records[record_index].byte_count
+                            );
+                            stage = HexStage::Address;
+                            field_buffer_seek = 0usize;
+                        }
+                    }
+                    HexStage::Address => {
+                        if field_buffer_seek == 4 {
+                            stage = HexStage::RecordType;
+                            hex_file.records[record_index].address = str2u16(field_buffer).unwrap();
+                            field_buffer_seek = 0usize;
+                        }
+                    }
+                    HexStage::RecordType => {
+                        if field_buffer_seek == 2 {
+                            stage = HexStage::Data;
+                            let [f, s, _, _] = field_buffer;
+                            let record_type = str2u8([f, s]).unwrap();
+                            println!("Record type {}", record_type);
+                            let record_type = match record_type {
+                                0u8 => RecordType::Data,
+                                1u8 => RecordType::Eof,
+                                2u8 => {
+                                    panic!("not imple no Extented Segment Address");
+                                }
+                                3u8 => RecordType::StartSegmentAddress,
+                                4u8 => {
+                                    panic!("Not Impl");
+                                }
+                                5u8 => RecordType::StartLinearAddress,
+                                _ => {
+                                    panic!("Hex file Error")
+                                }
+                            };
+
+                            hex_file.records[record_index].record_type = record_type;
+                            data_seek = 0usize;
+                            field_buffer_seek = 0usize;
+                        }
+                    }
+                    HexStage::Data => {
+                        if field_buffer_seek == 2 {
+                            field_buffer_seek = 0usize;
+                            let [f, s, _, _] = field_buffer;
+                            let data = str2u8([f, s]).unwrap();
+                            hex_file.records[record_index].data[data_seek] = data;
+                            data_seek = data_seek + 1;
+                            if data_seek >= hex_file.records[record_index].byte_count as usize {
+                                stage = HexStage::Checksum;
+                                info!("read all bytes");
+                            }
+                        }
+                    }
+                    HexStage::Checksum => {
+                        stage = HexStage::StartCode;
+
+                        if hex_file.records[record_index].record_type == RecordType::Eof {
+                            info!("read one record");
+                            read_done_flag = true;
+                            hex_file.record_count = record_index + 1;
+                        } // plz forget about checksum
+                        record_index = record_index + 1;
+                    }
+                }
+                seek = seek + 1;
+            }
+        }
+
+        let result = format!("Hex file records :  {} ", hex_file.record_count);
+        println!("{}", result);
+        let result = result.as_bytes();
+        let buffer: &[u8] = &read_buffer;
         let response = (
             picoserve::response::StatusCode::OK,
-            buffer, // 혹은 실제 해시 결과 문자열/바이트
+            result, // 혹은 실제 해시 결과 문자열/바이트
         );
 
         // 2. body_connection을 finalize()한 연결 객체와 response_writer를 함께 전달
@@ -440,7 +657,35 @@ async fn web_task(stack: &'static Stack<'static>) {
     let router = picoserve::Router::new()
         .route("/", get_service(html))
         .route("/health", get(|| async move { "OK" }))
-        .route("/upload", picoserve::routing::post_service(CalculateHash));
+        .route("/upload", post_service(UploadProc))
+        .route(
+            "/program",
+            get(|| async move {
+                WEB_COMMAND_SIGNAL.signal(WebCommand::Program);
+                "now programing"
+            }),
+        )
+        .route(
+            "/erase",
+            post(|| async move {
+                WEB_COMMAND_SIGNAL.signal(WebCommand::Erase);
+                "erase done "
+            }),
+        )
+        .route(
+            "/verify",
+            post(|| async move {
+                WEB_COMMAND_SIGNAL.signal(WebCommand::Verify);
+                "verify done "
+            }),
+        )
+        .route(
+            "/auto",
+            post(|| async move {
+                WEB_COMMAND_SIGNAL.signal(WebCommand::Auto);
+                "auto done"
+            }),
+        );
 
     let config = picoserve::Config::new(picoserve::Timeouts {
         start_read_request: Duration::from_secs(5),
@@ -460,9 +705,55 @@ async fn web_task(stack: &'static Stack<'static>) {
             info!("Socket accept error: {:?}", e);
             continue;
         }
-
-        let _ = picoserve::Server::new(&router, &config, &mut http_buffer)
+        info!("new socket");
+        let  _= picoserve::Server::new(&router, &config, &mut http_buffer)
             .serve(socket)
             .await;
+        
+        info!(" ?");
+    }
+}
+
+#[embassy_executor::task]
+async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
+    loop {
+        info!("s3 interface task run");
+        let web_command = WEB_COMMAND_SIGNAL.wait().await;
+        info!("get signal");
+        match web_command {
+            WebCommand::Erase => {
+                s3.init();
+                s3.enter_program_mode();
+                s3.erase();
+                s3.init();
+            }
+            WebCommand::Program => {
+                let mut hex_file = HEX_FILE.lock().await;
+                let mut address = 0u16;
+                let mut record_index = 0usize;
+                s3.init();
+                s3.enter_program_mode();
+                loop {
+
+                    match hex_file.records[record_index].record_type {
+                        RecordType::Eof => {
+                            break;
+                        }
+                        RecordType::Data => {
+                            let addr: usize =
+                                (hex_file.records[record_index].address + address) as usize;
+                            let len = hex_file.records[record_index].byte_count as usize;
+                            s3.write_all(addr, hex_file.records[record_index].data, len);
+                        }
+                        RecordType::StartLinearAddress => {}
+                        RecordType::StartSegmentAddress => {}
+                    }
+                    record_index += 1;
+                }
+            }
+            WebCommand::Verify => {}
+            WebCommand::Auto => {}
+        }
+        Timer::after(Duration::from_millis(500)).await
     }
 }
