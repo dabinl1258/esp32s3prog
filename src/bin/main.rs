@@ -9,6 +9,7 @@
 #![recursion_limit = "512"]
 extern crate alloc;
 use alloc::format;
+use critical_section;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -457,14 +458,14 @@ fn u8char2num16(ch: u8) -> Option<u16> {
     Some(u8char2num(ch).unwrap() as u16)
 }
 fn u8char2num(ch: u8) -> Option<u8> {
-    if ch >= '0' as u8 || ch <= '9' as u8 {
+    if ch >= '0' as u8 && ch <= '9' as u8 {
         return Some(ch - ('0' as u8));
     }
-    if ch >= 'a' as u8 || ch <= 'f' as u8 {
-        return Some(ch - ('a' as u8));
+    if ch >= 'a' as u8 && ch <= 'f' as u8 {
+        return Some(ch - ('a' as u8) + 0xa);
     }
-    if ch >= 'A' as u8 || ch <= 'F' as u8 {
-        return Some(ch - ('A' as u8));
+    if ch >= 'A' as u8 && ch <= 'F' as u8 {
+        return Some(ch - ('A' as u8) + 0xa);
     }
     None
 }
@@ -609,7 +610,6 @@ impl picoserve::routing::RequestHandlerService<()> for UploadProc {
                             data_seek = data_seek + 1;
                             if data_seek >= hex_file.records[record_index].byte_count as usize {
                                 stage = HexStage::Checksum;
-                                info!("read all bytes");
                             }
                         }
                     }
@@ -617,7 +617,7 @@ impl picoserve::routing::RequestHandlerService<()> for UploadProc {
                         stage = HexStage::StartCode;
 
                         if hex_file.records[record_index].record_type == RecordType::Eof {
-                            info!("read one record");
+                            info!("find EOF");
                             read_done_flag = true;
                             hex_file.record_count = record_index + 1;
                         } // plz forget about checksum
@@ -655,8 +655,9 @@ async fn web_task(stack: &'static Stack<'static>) {
         .route("/upload", post_service(UploadProc))
         .route(
             "/program",
-            get(|| async move {
+            post(|| async move {
                 WEB_COMMAND_SIGNAL.signal(WebCommand::Program);
+                info!("recived program command ");
                 "now programing"
             }),
         )
@@ -683,10 +684,10 @@ async fn web_task(stack: &'static Stack<'static>) {
         );
 
     let config = picoserve::Config::new(picoserve::Timeouts {
-        start_read_request: Duration::from_secs(5),
-        read_request: Duration::from_secs(10),
-        persistent_start_read_request: Duration::from_secs(10),
-        write: Duration::from_secs(10),
+        start_read_request: Duration::from_secs(100),
+        read_request: Duration::from_secs(100),
+        persistent_start_read_request: Duration::from_secs(100),
+        write: Duration::from_secs(100),
     });
 
     let mut rx_buffer = [0u8; 1024];
@@ -704,8 +705,6 @@ async fn web_task(stack: &'static Stack<'static>) {
         let _ = picoserve::Server::new(&router, &config, &mut http_buffer)
             .serve(socket)
             .await;
-
-        info!(" ?");
     }
 }
 
@@ -717,31 +716,47 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
         info!("get signal");
         match web_command {
             WebCommand::Erase => {
-                s3.init();
-                s3.enter_program_mode();
-                s3.erase();
-                s3.init();
+                critical_section::with(|_cs| {
+                    s3.init();
+                    s3.enter_program_mode();
+                    s3.erase();
+                    s3.init();
+                });
             }
             WebCommand::Program => {
                 let hex_file = HEX_FILE.lock().await;
                 let mut address = 0u16;
                 let mut record_index = 0usize;
-                s3.init();
-                s3.enter_program_mode();
+                critical_section::with(|_cs| {
+                    s3.init();
+                    s3.enter_program_mode();
+                });
                 loop {
                     match hex_file.records[record_index].record_type {
                         RecordType::Data => {
                             let addr: usize =
                                 (hex_file.records[record_index].address + address) as usize;
                             let len = hex_file.records[record_index].byte_count as usize;
-                            s3.write_all(addr, hex_file.records[record_index].data, len);
+                            println!(
+                                "Write addr {:#X}, len : {}, data  {:#X}",
+                                addr, len, hex_file.records[record_index].data[0]
+                            );
+                            critical_section::with(|_cs| {
+                                s3.write_all(addr, hex_file.records[record_index].data, len);
+                            });
                         }
                         RecordType::Eof => {
+                            println!("Program done");
                             break;
                         }
                         RecordType::ExtendedSegmentAddress => {
                             let [a, b, c, d, ..] = hex_file.records[record_index].data;
-                            address = str2u16([a, b, c, d]).unwrap();
+                            let a = (a as u32) << 24;
+                            let b = (b as u32) << 16;
+                            let c = (c as u32) << 8;
+                            let d = d as u32;
+
+                            address = (a + b + c + d) as u16;
                             address = address << 4;
                             println!("address changed at {}", address);
                         }
@@ -750,6 +765,7 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
                         RecordType::ExtendedLinearAddress => {}
                         RecordType::StartSegmentAddress => {}
                     }
+
                     record_index += 1;
                 }
             }
