@@ -803,7 +803,7 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
                     }
                     s3.init();
                     s3.enter_program_mode();
-                    s3.write_smart_option(0x0E3B, 0x00);
+                    s3.write_smart_option(0x0E3B, 0x04);
                     s3.delay.delay_millis(10); // 쓰기 완료 대기
                 });
                 let mut status_str = GLOBAL_STATUS.lock().await;
@@ -845,13 +845,13 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
                             s3.enter_program_mode();
                             let smart = s3.read_smart_option(0x0E3B);
                             let mut status_str = GLOBAL_STATUS.lock().await;
-                            if (verify_false == false) && (smart == 0x00) {
+                            if (verify_false == false) && (smart == 0x04) {
                                 *status_str = "verify success";
                             } else {
                                 *status_str = "verify false";
                             }
 
-                            println!("smart option {smart}  {} ", smart == 0x00);
+                            println!("smart option {smart}  {} ", smart == 0x04);
 
                             println!("verify_false{}  ", verify_false);
                             println!("verify done");
