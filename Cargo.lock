@@ -236,6 +236,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "defmt-rtt"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6eca0aae8aa2cf8333200ecbd236274697bc0a394765c858b3d9372eb1abcfa"
+dependencies = [
+ "critical-section",
+ "defmt 0.3.100",
+]
+
+[[package]]
 name = "delegate"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -597,7 +607,6 @@ version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42dee1e9ac7c3539bf6464db1707b0edd7557168f98278cf3c84fe70e63c6ce6"
 dependencies = [
- "defmt 1.1.1",
  "document-features",
  "esp-metadata-generated",
  "esp-sync",
@@ -741,6 +750,7 @@ version = "0.1.0"
 dependencies = [
  "critical-section",
  "defmt 1.1.1",
+ "defmt-rtt",
  "embedded-cli",
  "embedded-hal 1.0.0",
  "embedded-io 0.6.1",

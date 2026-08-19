@@ -14,6 +14,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 use core::convert::Infallible;
 use core::fmt::Write;
 use core::future::ready;
+use defmt_rtt as _;
 
 //use core::fmt::DebugList;
 //use embedded_hal::delay::DelayNs;
@@ -194,6 +195,32 @@ impl<'a> S3interface<'a> {
         self.send_byte(0xFF);
         self.stop_condition();
     }
+    pub fn write_smart_option(&mut self, addr: usize, byte: u8) {
+        self.start_condition();
+        // 0b1110 0000
+        // 0x E   0
+        self.send_byte(0xE0);
+        self.send_byte((addr >> 8) as u8);
+        self.send_byte(addr as u8);
+        self.send_byte(byte);
+        self.send_byte(0xFF);
+
+        self.sclk.set_high();
+        self.delay.delay_millis(30);
+        self.stop_condition();
+        self.delay.delay_millis(20);
+    }
+    pub fn read_smart_option(&mut self, addr: usize) -> u8 {
+        self.start_condition();
+        // 0b1110 0001
+        // 0x E   1
+        self.send_byte(0xE1);
+        self.send_byte((addr >> 8) as u8);
+        self.send_byte(addr as u8);
+        let value = self.read_byte();
+        self.stop_condition();
+        value
+    }
     pub fn erase(&mut self) {
         self.start_condition();
         self.send_byte(0xE0);
@@ -273,13 +300,16 @@ enum BaseCommand {
         addr: usize,
         size: usize,
     },
+    Smart,
 }
 
 #[main]
 fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let _peripherals = esp_hal::init(config);
-    info!("Hello");
+    esp_println::logger::init_logger_from_env();
+    // esp_println::logger::init_logger();
+    esp_println::println!("test");
 
     let reset = Output::new(
         _peripherals.GPIO4,
@@ -362,6 +392,22 @@ fn main() -> ! {
 
                             writeln!(cli.writer(), "read").ok();
                         }
+
+                        BaseCommand::Smart {} => {
+                            s3.init();
+                            s3.enter_program_mode();
+                            s3.write_smart_option(0x0E39, 0xA7);
+                            delay.delay_millis(10);
+                            s3.init();
+                            s3.enter_program_mode();
+
+                            let smart_option = s3.read_smart_option(0x0E39);
+                            if smart_option == 0xA7 {
+                                writeln!(cli.writer(), "smart option yes").ok();
+                            } else {
+                                writeln!(cli.writer(), "smart option no{}", smart_option).ok();
+                            }
+                        }
                         BaseCommand::Mem { addr, len } => {
                             let addr = addr as usize;
                             for idx in addr..(addr + len) {
@@ -428,6 +474,9 @@ fn main() -> ! {
                             s3.init();
                             s3.enter_program_mode();
                             s3.write_all(addr, flash_buffer, size);
+                            s3.init();
+                            s3.enter_program_mode();
+                            s3.write_smart_option(0x0E39, 0xA7); //(Internal RC 8MHz, LVR Enable & Level = 2.3V)
                         }
                         BaseCommand::Download => {}
                         BaseCommand::Crc => {}
@@ -437,7 +486,8 @@ fn main() -> ! {
                             let addr = addr as u16;
                             s3.start_condition();
                             let read = s3.read(addr, size);
-                            if flash_buffer[0..size] == read[0..size] {
+                            let smart_option = s3.read_smart_option(0x0E39);
+                            if flash_buffer[0..size] == read[0..size] && smart_option == 0xA7 {
                                 writeln!(cli.writer(), "verify ok").ok();
                             } else {
                                 writeln!(cli.writer(), "verify false").ok();
