@@ -9,8 +9,21 @@
 	<button type="button" onclick="erase()">Erase</button>
 	<button type="button" onclick="verify()">Verify</button>
 	<button type="button" onclick="auto()">Auto</button>
+	<button type="button" onclick="check_status()">결과 확인</button>
+	<br></br>
+	<textarea id="logScreen" readonly></textarea>
 
 	<script>
+		function addLog(message) {
+			const logScreen = document.getElementById('logScreen');
+			const now = new Date();
+			const timeString = now.toLocaleTimeString(); // 현재 시간 가져오기
+
+			// 기존 내용 뒤에 새로운 메시지와 줄바꿈(\n)을 추가한다곰
+			logScreen.value += `[${timeString}] ${message}\n`;
+			// 글이 많아지면 자동으로 맨 아래로 스크롤을 내려준다곰!
+			logScreen.scrollTop = logScreen.scrollHeight;
+		}
 		function uploadFile() {
 			const fileInput = document.getElementById('fileInput');
 			const file = fileInput.files[0];
@@ -28,8 +41,8 @@
 				},
 				body: file
 			})
-				.then(response => alert("Upload Done!"))
-				.catch(error => alert("Upload Error"));
+				.then(response => addLog("Upload done"))
+				.catch(error => addLog("Upload Error"));
 		}
 
 		function program() {
@@ -37,8 +50,8 @@
 				method: 'POST',
 
 			})
-				.then(response => alert("program Done!"))
-				.catch(error => alert("program Error"));
+				.then(response => addLog("program command sent"))
+				.catch(error => addLog("program command error"));
 
 
 		}
@@ -47,24 +60,37 @@
 				method: 'POST',
 
 			})
-				.then(response => alert("erase Done!"))
-				.catch(error => alert("erase Error"));
+				.then(response => addLog("erase Done!"))
+				.catch(error => addLog("erase Error"));
 		}
 		function verify() {
 			fetch('/verify', {
 				method: 'POST',
 
 			})
-				.then(response => alert("verify Done!"))
-				.catch(error => alert("verify Error"));
+				.then(response => addLog("verify Done!"))
+				.catch(error => addLog("verify Error"));
 		}
 		function auto() {
 			fetch('/auto', {
 				method: 'POST',
 
 			})
-				.then(response => alert("auto Done!"))
-				.catch(error => alert("auto Error"));
+				.then(response => addLog("auto Done!"))
+				.catch(error => addLog("auto Error"));
+
+
+		}
+		function check_status() {
+
+			fetch('/status', {
+				method: 'POST',
+
+			}).then(response => {
+				return response.text();
+			})
+				.then(data => addLog(data))
+				.catch(error => addLog("auto Error"));
 
 
 		}

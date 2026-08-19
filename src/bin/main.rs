@@ -8,7 +8,7 @@
 #![deny(clippy::large_stack_frames)]
 #![recursion_limit = "512"]
 extern crate alloc;
-use alloc::format;
+use alloc::{collections::btree_map::VacantEntry, format};
 use critical_section;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -280,6 +280,8 @@ unsafe extern "Rust" fn _esp_alloc_alloc(
 unsafe extern "Rust" fn _esp_alloc_dealloc(_heap: &EspHeap, ptr: usize, size: usize) {
     println!("Deallocated {} bytes: {:x}", size, ptr);
 }
+
+static GLOBAL_STATUS: Mutex<CriticalSectionRawMutex, &str> = Mutex::new("init status");
 
 #[embassy_executor::task]
 async fn wifi_task() {}
@@ -709,6 +711,13 @@ async fn web_task(stack: &'static Stack<'static>) {
                 WEB_COMMAND_SIGNAL.signal(WebCommand::Auto);
                 "auto done"
             }),
+        )
+        .route(
+            "/status",
+            post(|| async move {
+                let status = GLOBAL_STATUS.lock().await;
+                *status
+            }),
         );
 
     let config = picoserve::Config::new(picoserve::Timeouts {
@@ -743,11 +752,16 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
         let web_command = WEB_COMMAND_SIGNAL.wait().await;
         info!("get signal");
         match web_command {
-            WebCommand::Erase => critical_section::with(|_cs| {
-                s3.init();
-                s3.enter_program_mode();
-                s3.erase();
-            }),
+            WebCommand::Erase => {
+                critical_section::with(|_cs| {
+                    s3.init();
+                    s3.enter_program_mode();
+                    s3.erase();
+                });
+                let mut status_str = GLOBAL_STATUS.lock().await;
+                *status_str = "erase done";
+                println!("program done ");
+            }
             WebCommand::Program => {
                 let hex_file = HEX_FILE.lock().await;
                 let mut address = 0u16;
@@ -792,6 +806,8 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
                     s3.write_smart_option(0x0E3B, 0x00);
                     s3.delay.delay_millis(10); // 쓰기 완료 대기
                 });
+                let mut status_str = GLOBAL_STATUS.lock().await;
+                *status_str = "program done";
                 println!("program done ");
             }
             WebCommand::Verify => {
@@ -828,6 +844,13 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
                             s3.init();
                             s3.enter_program_mode();
                             let smart = s3.read_smart_option(0x0E3B);
+                            let mut status_str = GLOBAL_STATUS.lock().await;
+                            if (verify_false == false) && (smart == 0x00) {
+                                *status_str = "verify success";
+                            } else {
+                                *status_str = "verify false";
+                            }
+
                             println!("smart option {smart}  {} ", smart == 0x00);
 
                             println!("verify_false{}  ", verify_false);
