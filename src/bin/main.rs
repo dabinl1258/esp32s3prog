@@ -789,7 +789,7 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
                     }
                     s3.init();
                     s3.enter_program_mode();
-                    s3.write_smart_option(0x0E39, 0xA7);
+                    s3.write_smart_option(0x0E3B, 0x00);
                     s3.delay.delay_millis(10); // 쓰기 완료 대기
                 });
                 println!("program done ");
@@ -827,8 +827,8 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
                         RecordType::Eof => {
                             s3.init();
                             s3.enter_program_mode();
-                            let smart = s3.read_smart_option(0x0E39);
-                            println!("smart option {smart}  {} ", smart == 0xA7);
+                            let smart = s3.read_smart_option(0x0E3B);
+                            println!("smart option {smart}  {} ", smart == 0x00);
 
                             println!("verify_false{}  ", verify_false);
                             println!("verify done");
