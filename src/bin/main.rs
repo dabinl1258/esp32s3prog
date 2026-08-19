@@ -15,6 +15,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
+use embedded_hal::delay;
 use esp_backtrace as _;
 
 use esp_alloc as _;
@@ -65,6 +66,7 @@ macro_rules! mk_static {
 }
 
 const MEM_SIZE: usize = 255usize;
+
 struct S3interface<'a> {
     reset: Output<'a>,
     vpp: Output<'a>,
@@ -130,14 +132,15 @@ impl<'a> S3interface<'a> {
 
     pub fn read(&mut self, addr: u16, len: usize) -> [u8; MEM_SIZE] {
         let byte1: u8 = 0x61u8;
+        self.start_condition();
         self.send_byte(byte1);
         self.send_byte((addr >> 8) as u8);
         self.send_byte(addr as u8);
         let mut mem: [u8; MEM_SIZE] = [0; MEM_SIZE];
         for i in 0..len {
             mem[i] = self.read_byte();
-            //info!("{}", mem[i]);
         }
+        self.stop_condition();
         mem
     }
     pub fn read_byte(&mut self) -> u8 {
@@ -199,6 +202,32 @@ impl<'a> S3interface<'a> {
         self.send_byte(0xFF);
         self.stop_condition();
     }
+    pub fn write_smart_option(&mut self, addr: usize, byte: u8) {
+        self.start_condition();
+        // 0b1110 0000
+        // 0x E   0
+        self.send_byte(0xE0);
+        self.send_byte((addr >> 8) as u8);
+        self.send_byte(addr as u8);
+        self.send_byte(byte);
+        self.send_byte(0xFF);
+
+        self.sclk.set_high();
+        self.delay.delay_millis(30);
+        self.stop_condition();
+        self.delay.delay_millis(20);
+    }
+    pub fn read_smart_option(&mut self, addr: usize) -> u8 {
+        self.start_condition();
+        // 0b1110 0001
+        // 0x E   1
+        self.send_byte(0xE1);
+        self.send_byte((addr >> 8) as u8);
+        self.send_byte(addr as u8);
+        let value = self.read_byte();
+        self.stop_condition();
+        value
+    }
     pub fn erase(&mut self) {
         self.start_condition();
         self.send_byte(0xE0);
@@ -232,7 +261,6 @@ impl<'a> S3interface<'a> {
         self.delay.delay_micros(1); // 종료 후 대기
     }
 }
-
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -715,38 +743,95 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
         let web_command = WEB_COMMAND_SIGNAL.wait().await;
         info!("get signal");
         match web_command {
-            WebCommand::Erase => {
-                critical_section::with(|_cs| {
-                    s3.init();
-                    s3.enter_program_mode();
-                    s3.erase();
-                    s3.init();
-                });
-            }
+            WebCommand::Erase => critical_section::with(|_cs| {
+                s3.init();
+                s3.enter_program_mode();
+                s3.erase();
+            }),
             WebCommand::Program => {
                 let hex_file = HEX_FILE.lock().await;
                 let mut address = 0u16;
                 let mut record_index = 0usize;
                 critical_section::with(|_cs| {
+                    loop {
+                        match hex_file.records[record_index].record_type {
+                            RecordType::Data => {
+                                let addr: usize =
+                                    (hex_file.records[record_index].address + address) as usize;
+                                let len = hex_file.records[record_index].byte_count as usize;
+                                s3.init();
+                                s3.enter_program_mode();
+                                s3.write_all(addr, hex_file.records[record_index].data, len);
+                                s3.delay.delay_millis(10);
+                            }
+                            RecordType::Eof => {
+                                // println!("Program done");
+                                break;
+                            }
+                            RecordType::ExtendedSegmentAddress => {
+                                let [a, b, c, d, ..] = hex_file.records[record_index].data;
+                                let a = (a as u32) << 24;
+                                let b = (b as u32) << 16;
+                                let c = (c as u32) << 8;
+                                let d = d as u32;
+
+                                address = (a + b + c + d) as u16;
+                                address = address << 4;
+                                // println!("address changed at {}", address);
+                            }
+
+                            RecordType::StartLinearAddress => {}
+                            RecordType::ExtendedLinearAddress => {}
+                            RecordType::StartSegmentAddress => {}
+                        }
+
+                        record_index += 1;
+                    }
                     s3.init();
                     s3.enter_program_mode();
+                    s3.write_smart_option(0x0E39, 0xA7);
+                    s3.delay.delay_millis(10); // 쓰기 완료 대기
                 });
+                println!("program done ");
+            }
+            WebCommand::Verify => {
+                let hex_file = HEX_FILE.lock().await;
+                let mut address = 0u16;
+                let mut record_index = 0usize;
+                let mut verify_false = false;
                 loop {
                     match hex_file.records[record_index].record_type {
                         RecordType::Data => {
                             let addr: usize =
                                 (hex_file.records[record_index].address + address) as usize;
                             let len = hex_file.records[record_index].byte_count as usize;
-                            println!(
-                                "Write addr {:#X}, len : {}, data  {:#X}",
-                                addr, len, hex_file.records[record_index].data[0]
-                            );
+                            let mut readed: [u8; MEM_SIZE] = [0u8; MEM_SIZE];
+
                             critical_section::with(|_cs| {
-                                s3.write_all(addr, hex_file.records[record_index].data, len);
+                                s3.init();
+                                s3.enter_program_mode();
+                                readed = s3.read(addr as u16, len);
                             });
+                            for idx in 0..len {
+                                if readed[idx] != hex_file.records[record_index].data[idx] {
+                                    println!(
+                                        "verify false record {record_index} addr {addr} idx {} ,  {}, require {} ",
+                                        idx, readed[idx], hex_file.records[record_index].data[idx]
+                                    );
+                                    verify_false = true;
+                                } else {
+                                    // println!("verify ok {record_index} idx {idx}  {}", readed[idx]);
+                                }
+                            }
                         }
                         RecordType::Eof => {
-                            println!("Program done");
+                            s3.init();
+                            s3.enter_program_mode();
+                            let smart = s3.read_smart_option(0x0E39);
+                            println!("smart option {smart}  {} ", smart == 0xA7);
+
+                            println!("verify_false{}  ", verify_false);
+                            println!("verify done");
                             break;
                         }
                         RecordType::ExtendedSegmentAddress => {
@@ -769,8 +854,60 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
                     record_index += 1;
                 }
             }
-            WebCommand::Verify => {}
-            WebCommand::Auto => {}
+            WebCommand::Auto => {
+                println!("TEST");
+                critical_section::with(|_cs| {
+                    s3.init();
+                    s3.enter_program_mode();
+                    s3.erase();
+
+                    // --- S3 칩 단독 테스트 시작 ---
+                    println!("S3 Test Start");
+
+                    // 1. 하드웨어 통신 생사 확인 (Smart Option 쓰기 후 읽기)
+                    // [쓰기]
+                    s3.init();
+                    s3.enter_program_mode();
+                    s3.write_smart_option(0x0E39, 0xA7);
+                    s3.delay.delay_millis(10); // 쓰기 완료 대기
+
+                    // [읽기]
+                    s3.init();
+                    s3.enter_program_mode();
+                    let smart = s3.read_smart_option(0x0E39);
+
+                    // 2. Erase (지우기) - 인터럽트 차단 없이 자연스럽게 2초 대기
+                    s3.init();
+                    s3.enter_program_mode();
+                    s3.erase();
+
+                    // 3. Write
+                    let bytes = [0xau8; MEM_SIZE];
+                    s3.write_all(0, bytes, MEM_SIZE);
+
+                    // for addr in 0..5 {
+                    //     s3.init();
+                    //     s3.enter_program_mode();
+                    //     s3.write(addr as u16, 0xAA);
+                    //     // 필요시 짧은 대기 유지
+                    //     s3.delay.delay_millis(10);
+                    // }
+
+                    // 4. Read
+                    s3.init();
+                    s3.enter_program_mode();
+                    s3.start_condition();
+                    let mem = s3.read(0, 10);
+                    s3.stop_condition();
+
+                    // 5. 결과 출력
+                    println!("Smart Option Test: {:#04X}", smart);
+                    for idx in 0..10 {
+                        println!("addr {} : {}", idx, mem[idx]);
+                    }
+                    println!("S3 Test End");
+                })
+            }
         }
         Timer::after(Duration::from_millis(500)).await
     }
