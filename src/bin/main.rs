@@ -156,7 +156,6 @@ impl<'a> S3interface<'a> {
             self.sclk.set_high();
             self.delay.delay_micros(self.time_clk_high / 2);
             if self.sdat.is_high() {
-                //info!("test");
                 readed = readed | (0x01 << i);
             }
             self.delay.delay_micros(self.time_clk_high / 2);
@@ -475,7 +474,7 @@ enum WebCommand {
     Program,
     Erase,
     Verify,
-    Auto,
+    Test,
     ResetRun,
 }
 
@@ -708,7 +707,7 @@ async fn web_task(stack: &'static Stack<'static>) {
         .route(
             "/auto",
             post(|| async move {
-                WEB_COMMAND_SIGNAL.signal(WebCommand::Auto);
+                WEB_COMMAND_SIGNAL.signal(WebCommand::Test);
                 "auto"
             }),
         )
@@ -745,7 +744,7 @@ async fn web_task(stack: &'static Stack<'static>) {
             info!("Socket accept error: {:?}", e);
             continue;
         }
-        info!("new socket");
+
         let _ = picoserve::Server::new(&router, &config, &mut http_buffer)
             .serve(socket)
             .await;
@@ -755,9 +754,8 @@ async fn web_task(stack: &'static Stack<'static>) {
 #[embassy_executor::task]
 async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
     loop {
-        info!("s3 interface task run");
         let web_command = WEB_COMMAND_SIGNAL.wait().await;
-        info!("get signal");
+
         match web_command {
             WebCommand::Erase => {
                 critical_section::with(|_cs| {
@@ -884,7 +882,7 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
                     record_index += 1;
                 }
             }
-            WebCommand::Auto => {
+            WebCommand::Test => {
                 println!("TEST");
                 critical_section::with(|_cs| {
                     s3.init();
