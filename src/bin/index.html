@@ -8,12 +8,15 @@
 	<button type="button" onclick="erase()">Erase</button>
 	<button type="button" onclick="program()">Program</button>
 	<button type="button" onclick="verify()">Verify</button>
-	<button type="button" onclick="test()">Auto</button>
 	<button type="button" onclick="run()">Run</button>
 	<button type="button" onclick="check_status()">결과 확인</button>
 	<br></br>
 	<textarea id="logScreen" readonly rows="5" cols="33"></textarea>
+	<br></br>
+	<br></br>
+	<button type="button" onclick="test()">Test</button>
 
+	<br></br>
 	<script>
 		function addLog(message) {
 			const logScreen = document.getElementById('logScreen');
