@@ -3,8 +3,8 @@ runner = "espflash flash --monitor --chip esp32c6 --log-format defmt"
 
 [env]
 DEFMT_LOG="info"
-SSID = "dabin"
-PASSWORD = "ourwifi235711"
+SSID = "PRESS SSID"
+PASSWORD = "PRESS PASSWORD"
 
 [build]
 rustflags = [
