@@ -8,33 +8,27 @@
 #![deny(clippy::large_stack_frames)]
 #![recursion_limit = "512"]
 extern crate alloc;
-use alloc::{collections::btree_map::VacantEntry, format};
+use alloc::format;
 use critical_section;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
-use embedded_hal::delay;
 use esp_backtrace as _;
 
 use esp_alloc as _;
 //use core::fmt::DebugList;
 //use embedded_hal::delay::DelayNs;
 use defmt::info;
-use embassy_net::{
-    Runner, Stack, StackResources,
-    dns::DnsSocket,
-    tcp::TcpSocket,
-    tcp::client::{TcpClient, TcpClientState},
-};
+use embassy_net::{Runner, Stack, StackResources, tcp::TcpSocket};
+use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Flex, Level, Output, OutputConfig};
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::ram;
 use esp_hal::rng::Rng;
 use esp_hal::timer::timg::TimerGroup;
-use esp_hal::{clock::CpuClock, riscv::register::hpmcounter15h::read};
 
 use esp_println as _;
 use esp_println::println;
@@ -42,12 +36,11 @@ use esp_radio::wifi::{
     Config, ControllerConfig, Interface, WifiController, scan::ScanConfig, sta::StationConfig,
 };
 
-use picoserve::request::RequestBodyReader;
+use picoserve::io::Read;
 use picoserve::response::IntoResponse;
+use picoserve::routing::get_service;
 use picoserve::routing::post_service;
 use picoserve::routing::{get, post};
-use picoserve::{AppBuilder, io, request::Request, routing::get_service};
-use picoserve::{AppRouter, io::Read};
 
 #[panic_handler]
 fn panic(panic: &core::panic::PanicInfo) -> ! {
@@ -79,6 +72,7 @@ struct S3interface<'a> {
     time_clk_high: u32,
     time_dummy_low: u32,
     time_dummy_high: u32,
+    time_erase_time: u32,
     delay: Delay,
 }
 
@@ -95,6 +89,7 @@ impl<'a> S3interface<'a> {
             time_clk_high: 200,
             time_dummy_low: 200,
             time_dummy_high: 200,
+            time_erase_time: 70, // The programming tool must wait the maximum time indicated after a program or erase command before issuing another command. max 70ms
             delay: Delay::new(),
         }
     }
@@ -107,6 +102,14 @@ impl<'a> S3interface<'a> {
         self.sdat.set_input_enable(false);
         self.sdat.set_output_enable(true);
         self.sdat.set_low();
+    }
+
+    pub fn reset_run(&mut self) {
+        self.init();
+        self.delay.delay_millis(1);
+        self.reset.set_low();
+        self.delay.delay_millis(1); // reset logger than 1us
+        self.reset.set_high();
     }
 
     /// 프로그래밍 모드 시작 함수
@@ -236,7 +239,7 @@ impl<'a> S3interface<'a> {
         self.send_byte(0xAA);
         self.send_byte(0xFF);
         self.stop_condition();
-        self.delay.delay_millis(2000);
+        self.delay.delay_millis(self.time_erase_time);
     }
     pub fn start_condition(&mut self) {
         self.sdat.set_input_enable(false);
@@ -281,7 +284,7 @@ unsafe extern "Rust" fn _esp_alloc_dealloc(_heap: &EspHeap, ptr: usize, size: us
     println!("Deallocated {} bytes: {:x}", size, ptr);
 }
 
-static GLOBAL_STATUS: Mutex<CriticalSectionRawMutex, &str> = Mutex::new("init status");
+static GLOBAL_STATUS: Mutex<CriticalSectionRawMutex, &str> = Mutex::new("init_status:ok");
 
 #[embassy_executor::task]
 async fn wifi_task() {}
@@ -327,9 +330,9 @@ async fn main(spawner: Spawner) {
     sdat.set_low();
     let delay = Delay::new();
 
-    let mut s3 = S3interface::new(reset, vpp, sclk, sdat);
-    static s3_static: static_cell::StaticCell<S3interface> = static_cell::StaticCell::new();
-    let s3: &'static mut S3interface = s3_static.init(s3);
+    let s3 = S3interface::new(reset, vpp, sclk, sdat);
+    static S3_STATIC: static_cell::StaticCell<S3interface> = static_cell::StaticCell::new();
+    let s3: &'static mut S3interface = S3_STATIC.init(s3);
 
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
     spawner.spawn(s3_interface_task(s3).unwrap());
@@ -436,7 +439,7 @@ enum RecordType {
 
 #[derive(Copy, Clone)]
 pub struct HexRecord {
-    pub record_type: RecordType,
+    record_type: RecordType,
     pub byte_count: u8,
     pub address: u16,
     pub data: [u8; 255],
@@ -473,6 +476,7 @@ enum WebCommand {
     Erase,
     Verify,
     Auto,
+    ResetRun,
 }
 
 static WEB_COMMAND_SIGNAL: Signal<CriticalSectionRawMutex, WebCommand> = Signal::new();
@@ -536,8 +540,6 @@ impl picoserve::routing::RequestHandlerService<()> for UploadProc {
         let timeout = embassy_time::Duration::from_micros(
             request.body_connection.content_length() as u64 * 10,
         );
-        let start_time = embassy_time::Instant::now();
-
         let mut reader = request
             .body_connection
             .body()
@@ -547,9 +549,7 @@ impl picoserve::routing::RequestHandlerService<()> for UploadProc {
         let mut read_buffer = [0; 512];
         let mut hex_file = HEX_FILE.lock().await;
         let mut seek: usize;
-        let mut current_record = 0usize;
         let mut stage: HexStage = HexStage::StartCode;
-        let mut readed_byte_count: usize;
         let mut field_buffer: [u8; 4] = [0u8; 4];
         let mut field_buffer_seek = 0usize;
         let mut record_index: usize = 0usize;
@@ -661,7 +661,7 @@ impl picoserve::routing::RequestHandlerService<()> for UploadProc {
         let result = format!("Hex file records :  {} ", hex_file.record_count);
         println!("{}", result);
         let result = result.as_bytes();
-        let buffer: &[u8] = &read_buffer;
+        let _buffer: &[u8] = &read_buffer;
         let response = (
             picoserve::response::StatusCode::OK,
             result, // 혹은 실제 해시 결과 문자열/바이트
@@ -695,21 +695,21 @@ async fn web_task(stack: &'static Stack<'static>) {
             "/erase",
             post(|| async move {
                 WEB_COMMAND_SIGNAL.signal(WebCommand::Erase);
-                "erase done "
+                "erase"
             }),
         )
         .route(
             "/verify",
             post(|| async move {
                 WEB_COMMAND_SIGNAL.signal(WebCommand::Verify);
-                "verify done "
+                "verify"
             }),
         )
         .route(
             "/auto",
             post(|| async move {
                 WEB_COMMAND_SIGNAL.signal(WebCommand::Auto);
-                "auto done"
+                "auto"
             }),
         )
         .route(
@@ -717,6 +717,13 @@ async fn web_task(stack: &'static Stack<'static>) {
             post(|| async move {
                 let status = GLOBAL_STATUS.lock().await;
                 *status
+            }),
+        )
+        .route(
+            "/run",
+            post(|| async move {
+                WEB_COMMAND_SIGNAL.signal(WebCommand::ResetRun);
+                "run"
             }),
         );
 
@@ -759,7 +766,7 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
                     s3.erase();
                 });
                 let mut status_str = GLOBAL_STATUS.lock().await;
-                *status_str = "erase done";
+                *status_str = "erase:ok";
                 println!("program done ");
             }
             WebCommand::Program => {
@@ -807,7 +814,7 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
                     s3.delay.delay_millis(10); // 쓰기 완료 대기
                 });
                 let mut status_str = GLOBAL_STATUS.lock().await;
-                *status_str = "program done";
+                *status_str = "program:ok";
                 println!("program done ");
             }
             WebCommand::Verify => {
@@ -846,9 +853,9 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
                             let smart = s3.read_smart_option(0x0E3B);
                             let mut status_str = GLOBAL_STATUS.lock().await;
                             if (verify_false == false) && (smart == 0x04) {
-                                *status_str = "verify success";
+                                *status_str = "verify:ok";
                             } else {
-                                *status_str = "verify false";
+                                *status_str = "verify:false";
                             }
 
                             println!("smart option {smart}  {} ", smart == 0x04);
@@ -930,6 +937,13 @@ async fn s3_interface_task(s3: &'static mut S3interface<'static>) {
                     }
                     println!("S3 Test End");
                 })
+            }
+            WebCommand::ResetRun => {
+                critical_section::with(|_cs| {
+                    s3.reset_run();
+                });
+                let mut status = GLOBAL_STATUS.lock().await;
+                *status = "run:ok"
             }
         }
         Timer::after(Duration::from_millis(500)).await

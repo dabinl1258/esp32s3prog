@@ -8,7 +8,8 @@
 	<button type="button" onclick="program()">Program</button>
 	<button type="button" onclick="erase()">Erase</button>
 	<button type="button" onclick="verify()">Verify</button>
-	<button type="button" onclick="auto()">Auto</button>
+	<button type="button" onclick="test()">Auto</button>
+	<button type="button" onclick="run()">Run</button>
 	<button type="button" onclick="check_status()">결과 확인</button>
 	<br></br>
 	<textarea id="logScreen" readonly></textarea>
@@ -71,13 +72,23 @@
 				.then(response => addLog("verify Done!"))
 				.catch(error => addLog("verify Error"));
 		}
-		function auto() {
-			fetch('/auto', {
+		function test() {
+			fetch('/test', {
 				method: 'POST',
 
 			})
-				.then(response => addLog("auto Done!"))
-				.catch(error => addLog("auto Error"));
+				.then(response => addLog("try test"))
+				.catch(error => addLog("test Error"));
+
+
+		}
+		function run() {
+			fetch('/run', {
+				method: 'POST',
+
+			})
+				.then(response => addLog("try run"))
+				.catch(error => addLog("test Error"));
 
 
 		}
